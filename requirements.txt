@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+confluent-kafka
+sqlalchemy
+psycopg2-binary
+requests
