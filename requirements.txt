@@ -5,3 +5,4 @@ confluent-kafka
 sqlalchemy
 psycopg2-binary
 requests
+faker>=20.0.0
