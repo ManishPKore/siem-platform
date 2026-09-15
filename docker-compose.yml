@@ -77,12 +77,25 @@ services:
 
   postgres:
     image: postgres:15
+    hostname: postgres
     environment:
-      POSTGRES_DB: siem
-      POSTGRES_USER: siem
-      POSTGRES_PASSWORD: siem_dev_password
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Runs automatically on first container start (only when the data dir
+      # is empty). Every statement in the script is idempotent, so it's also
+      # safe to re-run manually -- see scripts/init_db.sql.
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
@@ -102,3 +115,4 @@ volumes:
   zookeeper-data:
   zookeeper-log:
   kafka-data:
+  postgres-data:
