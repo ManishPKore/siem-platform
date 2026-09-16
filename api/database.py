@@ -2,8 +2,7 @@
 
 Credentials are read from the environment (populated from .env via
 docker-compose, or python-dotenv when running locally) — never hardcoded
-here. Follows the same single-connection-string convention as
-KAFKA_BOOTSTRAP_SERVERS and ES_HOST elsewhere in .env.example.
+here.
 """
 
 import os
@@ -16,9 +15,6 @@ from sqlalchemy.orm import Session, sessionmaker
 POSTGRES_URL = os.environ.get("POSTGRES_URL")
 
 if not POSTGRES_URL:
-    # Fall back to building the DSN from the individual POSTGRES_* vars that
-    # docker-compose passes to the postgres container itself, so this still
-    # works if only those are set and POSTGRES_URL wasn't.
     user = os.environ.get("POSTGRES_USER")
     password = os.environ.get("POSTGRES_PASSWORD")
     host = os.environ.get("POSTGRES_HOST", "postgres")
@@ -32,10 +28,37 @@ if not POSTGRES_URL:
             "environment (see .env.example)."
         )
 
-    POSTGRES_URL = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+    POSTGRES_URL = (
+        f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+    )
 
-engine = create_engine(POSTGRES_URL, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+# Configure the connection pool only for PostgreSQL.
+# SQLite (used by the unit tests) uses a different pool implementation
+# that does not accept pool_size/max_overflow.
+engine_kwargs = {
+    "pool_pre_ping": True,
+    "future": True,
+}
+
+if POSTGRES_URL.startswith("postgresql"):
+    engine_kwargs.update(
+        {
+            "pool_size": 5,
+            "max_overflow": 15,
+        }
+    )
+
+engine = create_engine(
+    POSTGRES_URL,
+    **engine_kwargs,
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False,
+    future=True,
+)
 
 
 @contextmanager
