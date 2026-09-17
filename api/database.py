@@ -1,9 +1,12 @@
-"""Database engine and session factory.
+"""
+Database engine and session factory.
 
 Credentials are read from the environment (populated from .env via
 docker-compose, or python-dotenv when running locally) — never hardcoded
 here.
 """
+
+from __future__ import annotations
 
 import os
 from contextlib import contextmanager
@@ -11,6 +14,7 @@ from typing import Iterator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+
 
 POSTGRES_URL = os.environ.get("POSTGRES_URL")
 
@@ -32,9 +36,7 @@ if not POSTGRES_URL:
         f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
     )
 
-# Configure the connection pool only for PostgreSQL.
-# SQLite (used by the unit tests) uses a different pool implementation
-# that does not accept pool_size/max_overflow.
+
 engine_kwargs = {
     "pool_pre_ping": True,
     "future": True,
@@ -48,10 +50,12 @@ if POSTGRES_URL.startswith("postgresql"):
         }
     )
 
+
 engine = create_engine(
     POSTGRES_URL,
     **engine_kwargs,
 )
+
 
 SessionLocal = sessionmaker(
     bind=engine,
