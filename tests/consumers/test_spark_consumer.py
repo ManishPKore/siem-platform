@@ -1,5 +1,7 @@
+import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+from consumers.normalizer import RAW_EVENT_SCHEMA
 from consumers.spark_consumer import (
     DEFAULT_APP_NAME,
     DEFAULT_CHECKPOINT_DIR,
@@ -23,10 +26,8 @@ from consumers.spark_consumer import (
     DEFAULT_STARTING_OFFSETS,
     DEFAULT_TRIGGER_INTERVAL,
     KAFKA_CONNECTOR_PACKAGE,
-    LOG_EVENT_SCHEMA,
     SparkConsumerConfig,
-    build_spark_session,
-    parse_and_validate,
+    parse_normalize_and_validate,
     write_dead_letter_batch,
 )
 
@@ -43,6 +44,7 @@ def spark():
         .appName("siem-spark-consumer-tests")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
 
@@ -78,24 +80,134 @@ def make_kafka_df(spark, kafka_schema, records):
     return spark.createDataFrame(records, schema=kafka_schema)
 
 
-def valid_event():
-    return {
-        "event_id": "evt-001",
-        "timestamp": "2026-09-21T10:00:00Z",
-        "source_ip": "192.168.1.10",
+# --------------------------------------------------------------------------- #
+# Raw producer events
+#
+# These match producers/log_generator.py output.
+#
+# IMPORTANT:
+# These are intentionally NOT canonical LogEvent objects.
+# Issue #11 exists to normalize these raw events before validation.
+# --------------------------------------------------------------------------- #
+
+
+def raw_ssh_failed_login(**overrides):
+    event = {
+        "schema_version": "1.0",
+        "event_id": "evt-ssh-failed-1",
+        "timestamp": "2026-09-22T10:00:00Z",
+        "source_ip": "203.0.113.5",
         "event_type": "failed_login",
-        "severity": "MEDIUM",
-        "raw_message": "Failed password for user admin",
-        "source": "ssh",
         "username": "admin",
-        "auth_method": "password",
-        "success": False,
+        "service": "sshd",
+        "outcome": "failure",
+        "dest_port": 22,
+        "raw_message": (
+            "Failed password for admin from "
+            "203.0.113.5 port 51234 ssh2"
+        ),
     }
+
+    event.update(overrides)
+    return event
+
+
+def raw_ssh_successful_login(**overrides):
+    event = raw_ssh_failed_login(
+        event_id="evt-ssh-success-1",
+        event_type="successful_login",
+        outcome="success",
+        raw_message=(
+            "Accepted password for admin from "
+            "203.0.113.5 port 51234 ssh2"
+        ),
+    )
+
+    event.update(overrides)
+    return event
+
+
+def raw_web_request(**overrides):
+    event = {
+        "schema_version": "1.0",
+        "event_id": "evt-web-1",
+        "timestamp": "2026-09-22T10:05:00Z",
+        "source_ip": "198.51.100.23",
+        "event_type": "web_access",
+        "method": "GET",
+        "path": "/login",
+        "status_code": 200,
+        "user_agent": "Mozilla/5.0",
+        "bytes_sent": 512,
+        "raw_message": (
+            '198.51.100.23 - - '
+            '[22/Sep/2026:10:05:00 +0000] '
+            '"GET /login HTTP/1.1" 200 512 "-" '
+            '"Mozilla/5.0"'
+        ),
+    }
+
+    event.update(overrides)
+    return event
+
+
+def raw_firewall_drop(**overrides):
+    event = {
+        "schema_version": "1.0",
+        "event_id": "evt-fw-1",
+        "timestamp": "2026-09-22T10:10:00Z",
+        "source_ip": "198.51.100.44",
+        "event_type": "firewall_traffic",
+        "dest_ip": "10.0.0.5",
+        "dest_port": 22,
+        "src_port": 51000,
+        "protocol": "TCP",
+        "action": "DROP",
+        "raw_message": (
+            "DROP IN=eth0 OUT= SRC=198.51.100.44 "
+            "DST=10.0.0.5 PROTO=TCP SPT=51000 DPT=22"
+        ),
+    }
+
+    event.update(overrides)
+    return event
+
+
+def raw_sudo_command(**overrides):
+    event = {
+        "schema_version": "1.0",
+        "event_id": "evt-sudo-1",
+        "timestamp": "2026-09-22T10:15:00Z",
+        "source_ip": "203.0.113.9",
+        "event_type": "sudo_command",
+        "username": "alice",
+        "service": "sudo",
+        "outcome": "success",
+        "raw_message": (
+            "alice : TTY=pts/0 ; PWD=/home/alice ; "
+            "USER=root ; COMMAND=/bin/bash"
+        ),
+    }
+
+    event.update(overrides)
+    return event
+
+
+# --------------------------------------------------------------------------- #
+# SparkConsumerConfig
+# --------------------------------------------------------------------------- #
 
 
 class TestSparkConsumerConfig:
-    def test_from_env_requires_kafka_bootstrap_servers(self, monkeypatch):
-        monkeypatch.delenv("KAFKA_BOOTSTRAP_SERVERS", raising=False)
+
+    def test_from_env_requires_kafka_bootstrap_servers(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.delenv(
+            "KAFKA_BOOTSTRAP_SERVERS",
+            raising=False,
+        )
 
         with pytest.raises(
             RuntimeError,
@@ -186,74 +298,108 @@ class TestSparkConsumerConfig:
         assert Path(config.console_checkpoint_dir) == Path(
             "data/checkpoints/test/console"
         )
+
         assert Path(config.dead_letter_checkpoint_dir) == Path(
             "data/checkpoints/test/dead_letter"
         )
 
 
-class TestSparkSchema:
-    def test_log_event_schema_contains_required_fields(self):
+# --------------------------------------------------------------------------- #
+# Raw schema
+#
+# Issue #11 changes Spark parsing from the old canonical LOG_EVENT_SCHEMA
+# to RAW_EVENT_SCHEMA because Kafka contains producer-shaped events.
+# --------------------------------------------------------------------------- #
+
+
+class TestRawEventSchema:
+
+    def test_contains_universal_fields(self):
         fields = {
             field.name
-            for field in LOG_EVENT_SCHEMA.fields
+            for field in RAW_EVENT_SCHEMA.fields
         }
 
         required = {
+            "schema_version",
             "event_id",
             "timestamp",
             "source_ip",
             "event_type",
-            "severity",
             "raw_message",
-            "source",
         }
 
         assert required.issubset(fields)
 
-    def test_log_event_schema_contains_source_specific_fields(self):
+    def test_contains_ssh_auth_fields(self):
         fields = {
             field.name
-            for field in LOG_EVENT_SCHEMA.fields
+            for field in RAW_EVENT_SCHEMA.fields
         }
 
         expected = {
             "username",
-            "auth_method",
-            "success",
+            "service",
+            "outcome",
+            "dest_port",
+        }
+
+        assert expected.issubset(fields)
+
+    def test_contains_web_fields(self):
+        fields = {
+            field.name
+            for field in RAW_EVENT_SCHEMA.fields
+        }
+
+        expected = {
             "method",
             "path",
             "status_code",
             "user_agent",
             "bytes_sent",
-            "action",
+        }
+
+        assert expected.issubset(fields)
+
+    def test_contains_firewall_fields(self):
+        fields = {
+            field.name
+            for field in RAW_EVENT_SCHEMA.fields
+        }
+
+        expected = {
             "dest_ip",
-            "dest_port",
+            "src_port",
             "protocol",
-            "schema_version",
+            "action",
         }
 
         assert expected.issubset(fields)
 
 
+# --------------------------------------------------------------------------- #
+# Spark parsing + Issue #11 normalization
+# --------------------------------------------------------------------------- #
+
+
 class TestParseAndValidate:
-    def test_valid_record_is_marked_valid(
+
+    def test_ssh_failed_login_is_normalized_and_valid(
         self,
         spark,
         kafka_schema,
     ):
-        import json
-        from datetime import datetime
-
-        event = valid_event()
+        event = raw_ssh_failed_login()
 
         records = [
             (
                 json.dumps(event),
-                "192.168.1.10",
+                event["source_ip"],
                 "logs-raw",
                 0,
                 100,
-                datetime(2026, 9, 21, 10, 0, 0),
+                datetime(2026, 9, 22, 10, 0, 0),
             )
         ]
 
@@ -263,7 +409,7 @@ class TestParseAndValidate:
             records,
         )
 
-        result = parse_and_validate(raw_df)
+        result = parse_normalize_and_validate(raw_df)
 
         row = result.select(
             "event_id",
@@ -271,35 +417,37 @@ class TestParseAndValidate:
             "event_type",
             "severity",
             "source",
+            "username",
+            "auth_method",
+            "success",
             "_is_valid",
         ).first()
 
-        assert row.event_id == "evt-001"
-        assert row.source_ip == "192.168.1.10"
+        assert row.event_id == "evt-ssh-failed-1"
+        assert row.source_ip == "203.0.113.5"
         assert row.event_type == "failed_login"
         assert row.severity == "MEDIUM"
         assert row.source == "ssh"
+        assert row.username == "admin"
+        assert row.auth_method == "password"
+        assert row.success is False
         assert row._is_valid is True
 
-    def test_missing_required_field_is_invalid(
+    def test_ssh_successful_login_is_normalized_and_valid(
         self,
         spark,
         kafka_schema,
     ):
-        import json
-        from datetime import datetime
-
-        event = valid_event()
-        del event["severity"]
+        event = raw_ssh_successful_login()
 
         records = [
             (
                 json.dumps(event),
-                "192.168.1.10",
+                event["source_ip"],
                 "logs-raw",
                 0,
                 101,
-                datetime(2026, 9, 21, 10, 0, 0),
+                datetime(2026, 9, 22, 10, 0, 0),
             )
         ]
 
@@ -309,31 +457,29 @@ class TestParseAndValidate:
             records,
         )
 
-        result = parse_and_validate(raw_df)
+        row = parse_normalize_and_validate(raw_df).first()
 
-        row = result.select("_is_valid").first()
+        assert row.source == "ssh"
+        assert row.event_type == "successful_login"
+        assert row.severity == "INFO"
+        assert row.success is True
+        assert row._is_valid is True
 
-        assert row._is_valid is False
-
-    def test_blank_required_field_is_invalid(
+    def test_web_access_is_normalized_to_web_request(
         self,
         spark,
         kafka_schema,
     ):
-        import json
-        from datetime import datetime
-
-        event = valid_event()
-        event["source_ip"] = "   "
+        event = raw_web_request()
 
         records = [
             (
                 json.dumps(event),
-                "192.168.1.10",
+                event["source_ip"],
                 "logs-raw",
                 0,
                 102,
-                datetime(2026, 9, 21, 10, 0, 0),
+                datetime(2026, 9, 22, 10, 5, 0),
             )
         ]
 
@@ -343,27 +489,32 @@ class TestParseAndValidate:
             records,
         )
 
-        result = parse_and_validate(raw_df)
+        row = parse_normalize_and_validate(raw_df).first()
 
-        row = result.select("_is_valid").first()
+        assert row.source == "web"
+        assert row.event_type == "web_request"
+        assert row.method == "GET"
+        assert row.path == "/login"
+        assert row.status_code == 200
+        assert row.user_agent == "Mozilla/5.0"
+        assert row.severity == "INFO"
+        assert row._is_valid is True
 
-        assert row._is_valid is False
-
-    def test_invalid_json_is_invalid(
+    def test_firewall_drop_is_normalized(
         self,
         spark,
         kafka_schema,
     ):
-        from datetime import datetime
+        event = raw_firewall_drop()
 
         records = [
             (
-                "{this is not valid json}",
-                None,
+                json.dumps(event),
+                event["source_ip"],
                 "logs-raw",
                 0,
                 103,
-                datetime(2026, 9, 21, 10, 0, 0),
+                datetime(2026, 9, 22, 10, 10, 0),
             )
         ]
 
@@ -373,9 +524,273 @@ class TestParseAndValidate:
             records,
         )
 
-        result = parse_and_validate(raw_df)
+        row = parse_normalize_and_validate(raw_df).first()
 
-        row = result.select("_is_valid").first()
+        assert row.source == "firewall"
+        assert row.event_type == "firewall_drop"
+        assert row.action == "DROP"
+        assert row.dest_ip == "10.0.0.5"
+        assert row.dest_port == 22
+        assert row.severity == "MEDIUM"
+        assert row._is_valid is True
+
+    def test_auth_event_is_normalized(
+        self,
+        spark,
+        kafka_schema,
+    ):
+        event = raw_sudo_command()
+
+        records = [
+            (
+                json.dumps(event),
+                event["source_ip"],
+                "logs-raw",
+                0,
+                104,
+                datetime(2026, 9, 22, 10, 15, 0),
+            )
+        ]
+
+        raw_df = make_kafka_df(
+            spark,
+            kafka_schema,
+            records,
+        )
+
+        row = parse_normalize_and_validate(raw_df).first()
+
+        assert row.source == "auth"
+        assert row.event_type == "sudo_attempt"
+        assert row.auth_method == "sudo"
+        assert row.success is True
+        assert row.severity == "MEDIUM"
+        assert row._is_valid is True
+
+    def test_normalized_at_is_populated(
+        self,
+        spark,
+        kafka_schema,
+    ):
+        event = raw_ssh_failed_login()
+
+        records = [
+            (
+                json.dumps(event),
+                event["source_ip"],
+                "logs-raw",
+                0,
+                105,
+                datetime(2026, 9, 22, 10, 0, 0),
+            )
+        ]
+
+        raw_df = make_kafka_df(
+            spark,
+            kafka_schema,
+            records,
+        )
+
+        row = parse_normalize_and_validate(raw_df).select(
+            "normalized_at"
+        ).first()
+
+        assert row.normalized_at is not None
+
+    def test_event_timestamp_is_parsed(
+        self,
+        spark,
+        kafka_schema,
+    ):
+        event = raw_ssh_failed_login()
+
+        records = [
+            (
+                json.dumps(event),
+                event["source_ip"],
+                "logs-raw",
+                0,
+                106,
+                datetime(2026, 9, 22, 10, 0, 0),
+            )
+        ]
+
+        raw_df = make_kafka_df(
+            spark,
+            kafka_schema,
+            records,
+        )
+
+        row = parse_normalize_and_validate(raw_df).select(
+            "event_timestamp"
+        ).first()
+
+        assert row.event_timestamp is not None
+
+    def test_processing_lag_is_created(
+        self,
+        spark,
+        kafka_schema,
+    ):
+        event = raw_ssh_failed_login()
+
+        records = [
+            (
+                json.dumps(event),
+                event["source_ip"],
+                "logs-raw",
+                0,
+                107,
+                datetime(2026, 9, 22, 10, 0, 0),
+            )
+        ]
+
+        raw_df = make_kafka_df(
+            spark,
+            kafka_schema,
+            records,
+        )
+
+        row = parse_normalize_and_validate(raw_df).select(
+            "processing_lag_seconds"
+        ).first()
+
+        assert row.processing_lag_seconds is not None
+
+
+# --------------------------------------------------------------------------- #
+# Invalid records
+# --------------------------------------------------------------------------- #
+
+
+class TestInvalidRecords:
+
+    def test_unknown_event_type_is_invalid(
+        self,
+        spark,
+        kafka_schema,
+    ):
+        event = raw_ssh_failed_login(
+            event_type="totally_unknown_event",
+        )
+
+        records = [
+            (
+                json.dumps(event),
+                event["source_ip"],
+                "logs-raw",
+                0,
+                200,
+                datetime(2026, 9, 22, 10, 0, 0),
+            )
+        ]
+
+        raw_df = make_kafka_df(
+            spark,
+            kafka_schema,
+            records,
+        )
+
+        row = parse_normalize_and_validate(raw_df).first()
+
+        assert row.source is None
+        assert row.event_type is None
+        assert row.severity is None
+        assert row._is_valid is False
+
+    def test_missing_event_id_is_invalid(
+        self,
+        spark,
+        kafka_schema,
+    ):
+        event = raw_ssh_failed_login(
+            event_id=None,
+        )
+
+        records = [
+            (
+                json.dumps(event),
+                event["source_ip"],
+                "logs-raw",
+                0,
+                201,
+                datetime(2026, 9, 22, 10, 0, 0),
+            )
+        ]
+
+        raw_df = make_kafka_df(
+            spark,
+            kafka_schema,
+            records,
+        )
+
+        row = parse_normalize_and_validate(raw_df).select(
+            "_is_valid"
+        ).first()
+
+        assert row._is_valid is False
+
+    def test_missing_source_ip_is_invalid(
+        self,
+        spark,
+        kafka_schema,
+    ):
+        event = raw_ssh_failed_login(
+            source_ip=None,
+        )
+
+        records = [
+            (
+                json.dumps(event),
+                None,
+                "logs-raw",
+                0,
+                202,
+                datetime(2026, 9, 22, 10, 0, 0),
+            )
+        ]
+
+        raw_df = make_kafka_df(
+            spark,
+            kafka_schema,
+            records,
+        )
+
+        row = parse_normalize_and_validate(raw_df).select(
+            "_is_valid"
+        ).first()
+
+        assert row._is_valid is False
+
+    def test_blank_source_ip_is_invalid(
+        self,
+        spark,
+        kafka_schema,
+    ):
+        event = raw_ssh_failed_login(
+            source_ip="   ",
+        )
+
+        records = [
+            (
+                json.dumps(event),
+                "   ",
+                "logs-raw",
+                0,
+                203,
+                datetime(2026, 9, 22, 10, 0, 0),
+            )
+        ]
+
+        raw_df = make_kafka_df(
+            spark,
+            kafka_schema,
+            records,
+        )
+
+        row = parse_normalize_and_validate(raw_df).select(
+            "_is_valid"
+        ).first()
 
         assert row._is_valid is False
 
@@ -384,20 +799,18 @@ class TestParseAndValidate:
         spark,
         kafka_schema,
     ):
-        import json
-        from datetime import datetime
-
-        event = valid_event()
-        event["timestamp"] = "not-a-timestamp"
+        event = raw_ssh_failed_login(
+            timestamp="not-a-timestamp",
+        )
 
         records = [
             (
                 json.dumps(event),
-                "192.168.1.10",
+                event["source_ip"],
                 "logs-raw",
                 0,
-                104,
-                datetime(2026, 9, 21, 10, 0, 0),
+                204,
+                datetime(2026, 9, 22, 10, 0, 0),
             )
         ]
 
@@ -407,9 +820,7 @@ class TestParseAndValidate:
             records,
         )
 
-        result = parse_and_validate(raw_df)
-
-        row = result.select(
+        row = parse_normalize_and_validate(raw_df).select(
             "event_timestamp",
             "_is_valid",
         ).first()
@@ -417,24 +828,23 @@ class TestParseAndValidate:
         assert row.event_timestamp is None
         assert row._is_valid is False
 
-    def test_timestamp_with_utc_z_is_parsed(
+    def test_unknown_firewall_action_is_invalid(
         self,
         spark,
         kafka_schema,
     ):
-        import json
-        from datetime import datetime
-
-        event = valid_event()
+        event = raw_firewall_drop(
+            action="UNKNOWN",
+        )
 
         records = [
             (
                 json.dumps(event),
-                "192.168.1.10",
+                event["source_ip"],
                 "logs-raw",
                 0,
-                105,
-                datetime(2026, 9, 21, 10, 0, 0),
+                205,
+                datetime(2026, 9, 22, 10, 10, 0),
             )
         ]
 
@@ -444,31 +854,29 @@ class TestParseAndValidate:
             records,
         )
 
-        row = parse_and_validate(raw_df).select(
-            "event_timestamp"
-        ).first()
+        row = parse_normalize_and_validate(raw_df).first()
 
-        assert row.event_timestamp is not None
+        assert row.event_type is None
+        assert row.severity is None
+        assert row._is_valid is False
 
-    def test_timestamp_with_offset_is_parsed(
+    def test_missing_firewall_action_is_invalid(
         self,
         spark,
         kafka_schema,
     ):
-        import json
-        from datetime import datetime
-
-        event = valid_event()
-        event["timestamp"] = "2026-09-21T10:00:00+00:00"
+        event = raw_firewall_drop(
+            action=None,
+        )
 
         records = [
             (
                 json.dumps(event),
-                "192.168.1.10",
+                event["source_ip"],
                 "logs-raw",
                 0,
-                106,
-                datetime(2026, 9, 21, 10, 0, 0),
+                206,
+                datetime(2026, 9, 22, 10, 10, 0),
             )
         ]
 
@@ -478,21 +886,62 @@ class TestParseAndValidate:
             records,
         )
 
-        row = parse_and_validate(raw_df).select(
-            "event_timestamp"
+        row = parse_normalize_and_validate(raw_df).first()
+
+        assert row.event_type is None
+        assert row.severity is None
+        assert row._is_valid is False
+
+
+# --------------------------------------------------------------------------- #
+# Malformed JSON
+# --------------------------------------------------------------------------- #
+
+
+class TestMalformedJson:
+
+    def test_invalid_json_is_invalid(
+        self,
+        spark,
+        kafka_schema,
+    ):
+        records = [
+            (
+                "{this is not valid json}",
+                None,
+                "logs-raw",
+                0,
+                300,
+                datetime(2026, 9, 22, 10, 0, 0),
+            )
+        ]
+
+        raw_df = make_kafka_df(
+            spark,
+            kafka_schema,
+            records,
+        )
+
+        row = parse_normalize_and_validate(raw_df).select(
+            "_is_valid"
         ).first()
 
-        assert row.event_timestamp is not None
+        assert row._is_valid is False
+
+
+# --------------------------------------------------------------------------- #
+# Kafka metadata
+# --------------------------------------------------------------------------- #
+
+
+class TestKafkaMetadata:
 
     def test_kafka_metadata_is_preserved(
         self,
         spark,
         kafka_schema,
     ):
-        import json
-        from datetime import datetime
-
-        event = valid_event()
+        event = raw_ssh_failed_login()
 
         records = [
             (
@@ -501,7 +950,7 @@ class TestParseAndValidate:
                 "logs-raw",
                 3,
                 999,
-                datetime(2026, 9, 21, 10, 0, 0),
+                datetime(2026, 9, 22, 10, 0, 0),
             )
         ]
 
@@ -511,7 +960,7 @@ class TestParseAndValidate:
             records,
         )
 
-        row = parse_and_validate(raw_df).select(
+        row = parse_normalize_and_validate(raw_df).select(
             "kafka_key",
             "kafka_topic",
             "kafka_partition",
@@ -524,24 +973,98 @@ class TestParseAndValidate:
         assert row.kafka_offset == 999
 
 
-class TestSparkSession:
-    def test_build_spark_session_uses_config(self, spark):
-        config = SparkConsumerConfig(
-            bootstrap_servers="localhost:9092",
-            master="local[2]",
-            app_name="test-spark-consumer",
+# --------------------------------------------------------------------------- #
+# Mixed batch
+#
+# Verifies that different raw source types can be normalized in the same
+# Spark DataFrame.
+# --------------------------------------------------------------------------- #
+
+
+class TestMixedBatch:
+
+    def test_multiple_raw_sources_normalize_in_one_batch(
+        self,
+        spark,
+        kafka_schema,
+    ):
+        events = [
+            raw_ssh_failed_login(
+                event_id="ssh-1",
+            ),
+            raw_web_request(
+                event_id="web-1",
+            ),
+            raw_firewall_drop(
+                event_id="fw-1",
+            ),
+            raw_sudo_command(
+                event_id="auth-1",
+            ),
+        ]
+
+        records = [
+            (
+                json.dumps(event),
+                event["source_ip"],
+                "logs-raw",
+                0,
+                index,
+                datetime(2026, 9, 22, 10, 0, 0),
+            )
+            for index, event in enumerate(events)
+        ]
+
+        raw_df = make_kafka_df(
+            spark,
+            kafka_schema,
+            records,
         )
 
-        # Reuse the test session's JVM; don't create a second Spark
-        # application just for this configuration test.
-        assert config.master == "local[2]"
-        assert config.app_name == "test-spark-consumer"
+        result = parse_normalize_and_validate(raw_df)
+
+        rows = {
+            row.event_id: row
+            for row in result.collect()
+        }
+
+        assert len(rows) == 4
+
+        assert rows["ssh-1"].source == "ssh"
+        assert rows["ssh-1"].event_type == "failed_login"
+
+        assert rows["web-1"].source == "web"
+        assert rows["web-1"].event_type == "web_request"
+
+        assert rows["fw-1"].source == "firewall"
+        assert rows["fw-1"].event_type == "firewall_drop"
+
+        assert rows["auth-1"].source == "auth"
+        assert rows["auth-1"].event_type == "sudo_attempt"
+
+        assert all(row._is_valid for row in rows.values())
+
+
+# --------------------------------------------------------------------------- #
+# Spark constants
+# --------------------------------------------------------------------------- #
+
+
+class TestSparkConstants:
+
+    def test_kafka_connector_package_matches_spark_version(self):
         assert KAFKA_CONNECTOR_PACKAGE == (
             "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
         )
 
 
+# --------------------------------------------------------------------------- #
+# Dead-letter writer
+# --------------------------------------------------------------------------- #
+
+
 class TestDeadLetter:
+
     def test_write_dead_letter_batch_writes_invalid_records(
         self,
         spark,
@@ -552,8 +1075,6 @@ class TestDeadLetter:
                 "Spark JSON filesystem writes require Hadoop winutils on Windows"
             )
 
-        from datetime import datetime
-
         output_dir = str(tmp_path / "dead_letter")
 
         records = [
@@ -563,7 +1084,7 @@ class TestDeadLetter:
                 "logs-raw",
                 0,
                 200,
-                datetime(2026, 9, 21, 10, 0, 0),
+                datetime(2026, 9, 22, 10, 0, 0),
             )
         ]
 

@@ -3,16 +3,19 @@ consumers/spark_consumer.py
 
 PySpark Structured Streaming replacement for the plain Kafka consumer
 (consumers/log_consumer.py, Issue #5). This is the processing engine
-detection rules (future issues) will be built on top of: it reads
-normalized log events from the `logs-raw` Kafka topic in near real
-time, validates each record against the canonical schema introduced in
-Issue #6 (consumers/schemas.py), and fans out into two sinks:
+detection rules (future issues) will be built on top of: it reads raw log
+events from the `logs-raw` Kafka topic in near real time, normalizes them
+into the canonical schema from Issue #6 (consumers/schemas.py -- see
+consumers/normalizer.py, Issue #11), validates the normalized result, and
+fans out into two sinks:
 
     * valid records   -> console sink (stdout), for now -- this will be
       swapped for the enrichment/detection sinks in a later issue.
-    * invalid records (unparsable JSON, or missing/blank required
-      fields) -> an append-only JSON "dead letter" store under
-      data/dead_letter/, so nothing is ever silently dropped.
+    * invalid records (unparsable JSON, missing/blank required fields
+      after normalization, or an unrecognized raw `event_type` that
+      normalize_event() couldn't map to a known source) -> an
+      append-only, UTC-date-partitioned JSON "dead letter" store under
+      data/dead_letter/YYYY-MM-DD/, so nothing is ever silently dropped.
 
 Unlike consumers/log_consumer.py (confluent-kafka, one record at a
 time, Python-level offset commits), this reads Kafka via Spark's
@@ -46,8 +49,7 @@ Run locally
 
        python producers/log_generator.py --rate 10 | python producers/log_producer.py
 
-   Parsed events should appear on the console within a couple of
-   seconds.
+   Normalized events should appear on the console within a couple of seconds.
 
 Running against the docker-compose Spark cluster
 ---------------------------------------------------
@@ -78,7 +80,10 @@ Configuration (environment variables)
                                      under the <5s lag acceptance target
                                      to leave headroom for processing)
     SPARK_CHECKPOINT_DIR            default "data/checkpoints/spark_consumer"
-    SPARK_DEAD_LETTER_DIR           default "data/dead_letter"
+    SPARK_DEAD_LETTER_DIR           default "data/dead_letter" (batches
+                                     are actually written under
+                                     <this>/YYYY-MM-DD/ -- see
+                                     consumers.normalizer.dead_letter_output_path)
     SPARK_FAIL_ON_DATA_LOSS         default "false" (see inline comment
                                      on the Kafka source options below)
     SPARK_MAX_OFFSETS_PER_TRIGGER   optional; unset = no cap
@@ -104,16 +109,29 @@ Malformed / invalid records
 -----------------------------
 `from_json` never raises on bad input -- a value that isn't valid JSON,
 or is valid JSON but missing/mistyped fields, just produces nulls for
-the affected column(s) (Spark's PERMISSIVE mode). This job treats a
-record as invalid if any REQUIRED_LOG_FIELDS column is null/blank
-after parsing, or its `timestamp` field can't be parsed into an actual
-timestamp. REQUIRED_LOG_FIELDS is imported from consumers.log_consumer
-rather than redefined here, so the Spark and non-Spark consumers can
-never validate against two different definitions of "required".
-Invalid records are written to SPARK_DEAD_LETTER_DIR as
-newline-delimited JSON (original raw_value plus Kafka metadata), and
-every micro-batch containing at least one logs a warning with the
-count -- see write_dead_letter_batch() below.
+the affected column(s) (Spark's PERMISSIVE mode). This job parses the
+Kafka payload against consumers.normalizer.RAW_EVENT_SCHEMA (the shape
+producers/log_generator.py actually emits -- NOT the canonical LogEvent
+shape), normalizes it into canonical fields via
+consumers.normalizer.normalize_event() (Issue #11), and then treats a
+row as invalid if any canonical REQUIRED_LOG_FIELDS column is
+null/blank after normalization, or its `timestamp` field can't be
+parsed into an actual timestamp. That required-fields check
+(consumers.normalizer.required_field_mask(), reused via
+is_normalization_valid()) is defined against
+consumers.log_consumer.REQUIRED_LOG_FIELDS, so the Spark and
+non-Spark consumers can never validate against two different
+definitions of "required". An unrecognized raw `event_type` -- one
+normalize_event() can't map to a known source -- comes out of
+normalization with `source` (and therefore `event_type`, `severity`)
+NULL, which fails that same required-fields check; there is no
+separate "unrecognized source" code path.
+
+Invalid records are written to SPARK_DEAD_LETTER_DIR/YYYY-MM-DD/ as
+newline-delimited JSON (the normalized row, including the original
+raw_value and Kafka metadata), and every micro-batch containing at
+least one logs a warning with the count -- see write_dead_letter_batch()
+below.
 """
 
 from __future__ import annotations
@@ -127,20 +145,15 @@ from typing import Optional
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    BooleanType,
-    IntegerType,
-    StringType,
-    StructField,
-    StructType,
-)
 
-# Reuse the base consumer's definition of "required fields" so the
-# Spark and confluent-kafka consumers can never silently drift apart on
-# what counts as a valid record. confluent-kafka is already a hard
-# project dependency (used by log_consumer.py / log_producer.py), so
-# this import adds no new dependency.
-from consumers.log_consumer import DEFAULT_TOPIC, REQUIRED_LOG_FIELDS
+from consumers.log_consumer import DEFAULT_TOPIC
+
+from consumers.normalizer import (
+    RAW_EVENT_SCHEMA,
+    dead_letter_output_path,
+    is_normalization_valid,
+    normalize_event,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -149,8 +162,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("spark_consumer")
 
-# The connector version must match the Spark version, which must match
-# the Spark image used in docker-compose.yml.
 SPARK_VERSION = "3.5.1"
 SCALA_BINARY_VERSION = "2.12"
 KAFKA_CONNECTOR_PACKAGE = (
@@ -163,88 +174,6 @@ DEFAULT_STARTING_OFFSETS = "earliest"
 DEFAULT_TRIGGER_INTERVAL = "2 seconds"
 DEFAULT_CHECKPOINT_DIR = "data/checkpoints/spark_consumer"
 DEFAULT_DEAD_LETTER_DIR = "data/dead_letter"
-
-
-# --------------------------------------------------------------------------- #
-# Canonical event schema (Issue #6 -- consumers/schemas.py::LogEvent)
-# --------------------------------------------------------------------------- #
-#
-# `timestamp` is read as a plain string, not TimestampType: from_json's
-# built-in timestamp parsing is picky about the exact pattern and
-# silently nulls the field on any mismatch, which would make a
-# perfectly valid record look "invalid". It's parsed explicitly below
-# instead, with an explicit set of accepted patterns, so the failure
-# mode is visible and testable rather than implicit in the schema.
-#
-# Every field is nullable=True at the Spark schema level -- Spark
-# doesn't reject/fail rows for a "non-nullable" field missing from the
-# JSON, it just leaves it null, so nullable=False here would be
-# misleading. REQUIRED_LOG_FIELDS (imported above) is what actually
-# enforces which fields must be present -- see _build_required_field_mask.
-LOG_EVENT_SCHEMA = StructType(
-    [
-        # --- Universal fields (every source) ---
-        StructField("event_id", StringType(), True),
-        StructField("timestamp", StringType(), True),
-        StructField("source_ip", StringType(), True),
-        StructField("event_type", StringType(), True),
-        StructField("severity", StringType(), True),
-        StructField("raw_message", StringType(), True),
-        StructField("source", StringType(), True),
-        # --- SSH-specific ---
-        StructField("username", StringType(), True),
-        StructField("auth_method", StringType(), True),
-        StructField("success", BooleanType(), True),
-        # --- Web-specific ---
-        StructField("method", StringType(), True),
-        StructField("path", StringType(), True),
-        StructField("status_code", IntegerType(), True),
-        StructField("user_agent", StringType(), True),
-        StructField("bytes_sent", IntegerType(), True),
-        # --- Firewall-specific ---
-        StructField("action", StringType(), True),
-        StructField("dest_ip", StringType(), True),
-        StructField("dest_port", IntegerType(), True),
-        StructField("protocol", StringType(), True),
-        # --- Present on producers/log_generator.py output, not part of
-        # the strict LogEvent contract; kept so it isn't lost, never
-        # required. ---
-        StructField("schema_version", StringType(), True),
-    ]
-)
-
-# ISO-8601 patterns actually seen on `logs-raw`:
-#   producers/log_generator.py's iso()          -> "2026-09-04T10:00:00Z"
-#   consumers/schemas.py's LogEvent.isoformat()  -> "2026-09-04T10:00:00+00:00"
-# Both are tried, in order; F.coalesce keeps the first non-null result.
-_TIMESTAMP_PATTERNS = ("yyyy-MM-dd'T'HH:mm:ss'Z'", "yyyy-MM-dd'T'HH:mm:ssXXX")
-
-
-def _parse_event_timestamp(column: str):
-    candidates = [F.to_timestamp(F.col(column), p) for p in _TIMESTAMP_PATTERNS]
-    # Bare fallback with no explicit pattern, in case a producer ever
-    # emits fractional seconds or an offset the two patterns above
-    # don't cover but Spark's default parser does.
-    candidates.append(F.to_timestamp(F.col(column)))
-    return F.coalesce(*candidates)
-
-
-def _build_required_field_mask():
-    """AND together an isNotNull/non-blank check for every field in
-    REQUIRED_LOG_FIELDS. `timestamp` is checked via the parsed
-    `event_timestamp` column instead of the raw string, since a
-    non-blank-but-unparsable timestamp is exactly as invalid as a
-    missing one."""
-    checks = []
-    for field in sorted(REQUIRED_LOG_FIELDS):
-        if field == "timestamp":
-            checks.append(F.col("event_timestamp").isNotNull())
-        else:
-            checks.append(F.col(field).isNotNull() & (F.trim(F.col(field)) != ""))
-    mask = checks[0]
-    for check in checks[1:]:
-        mask = mask & check
-    return mask
 
 
 # --------------------------------------------------------------------------- #
@@ -319,9 +248,6 @@ def build_spark_session(config: SparkConsumerConfig) -> SparkSession:
     return (
         SparkSession.builder.appName(config.app_name)
         .master(config.master)
-        # Lets `python consumers/spark_consumer.py` work without an
-        # explicit `--packages` flag (see module docstring). Harmless
-        # no-op if the connector is already on the classpath.
         .config("spark.jars.packages", KAFKA_CONNECTOR_PACKAGE)
         .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
@@ -334,14 +260,6 @@ def read_kafka_stream(spark: SparkSession, config: SparkConsumerConfig) -> DataF
         .option("kafka.bootstrap.servers", config.bootstrap_servers)
         .option("subscribe", config.topic)
         .option("startingOffsets", config.starting_offsets)
-        # If Kafka has already deleted offsets this query would read
-        # next (e.g. retention expired while the job was down), the
-        # default (true) fails the whole query. false logs and skips
-        # ahead instead -- the right trade-off for a dev/local topic
-        # with 24h retention (docker-compose.yml) where "the job was
-        # down over the weekend" is routine, not fatal. Flip to true
-        # for a deployment where silently skipping lost data is
-        # unacceptable.
         .option("failOnDataLoss", str(config.fail_on_data_loss).lower())
     )
     if config.max_offsets_per_trigger:
@@ -352,14 +270,19 @@ def read_kafka_stream(spark: SparkSession, config: SparkConsumerConfig) -> DataF
 
 
 # --------------------------------------------------------------------------- #
-# Parsing / validation
+# Parsing / normalization / validation
 # --------------------------------------------------------------------------- #
 
 
-def parse_and_validate(raw_df: DataFrame) -> DataFrame:
-    """Parse the Kafka `value` bytes as JSON against LOG_EVENT_SCHEMA and
-    add the columns downstream code needs to split valid vs invalid
-    records. Never drops or raises on bad input -- see module docstring.
+def parse_normalize_and_validate(raw_df: DataFrame) -> DataFrame:
+    """
+    Parse the Kafka `value` bytes as raw producer-shaped JSON
+    (consumers.normalizer.RAW_EVENT_SCHEMA), normalize into the canonical
+    LogEvent shape (consumers.normalizer.normalize_event(), Issue #11),
+    and mark each row valid/invalid via
+    consumers.normalizer.is_normalization_valid() for downstream routing.
+
+    Never drops or raises on bad input -- see module docstring.
     """
     parsed = (
         raw_df.select(
@@ -370,7 +293,7 @@ def parse_and_validate(raw_df: DataFrame) -> DataFrame:
             F.col("offset").alias("kafka_offset"),
             F.col("timestamp").alias("kafka_produced_at"),
         )
-        .withColumn("_parsed", F.from_json(F.col("raw_value"), LOG_EVENT_SCHEMA))
+        .withColumn("_parsed", F.from_json(F.col("raw_value"), RAW_EVENT_SCHEMA))
         .select(
             "raw_value",
             "kafka_key",
@@ -380,14 +303,17 @@ def parse_and_validate(raw_df: DataFrame) -> DataFrame:
             "kafka_produced_at",
             "_parsed.*",
         )
-        .withColumn("event_timestamp", _parse_event_timestamp("timestamp"))
-        .withColumn(
-            "processing_lag_seconds",
-            F.unix_timestamp(F.current_timestamp())
-            - F.unix_timestamp(F.col("event_timestamp")),
-        )
     )
-    return parsed.withColumn("_is_valid", _build_required_field_mask())
+
+    normalized = normalize_event(parsed)
+
+    normalized = normalized.withColumn(
+        "processing_lag_seconds",
+        F.unix_timestamp(F.current_timestamp())
+        - F.unix_timestamp(F.col("event_timestamp")),
+    )
+
+    return is_normalization_valid(normalized)
 
 
 # --------------------------------------------------------------------------- #
@@ -397,11 +323,14 @@ def parse_and_validate(raw_df: DataFrame) -> DataFrame:
 
 def write_dead_letter_batch(dead_letter_dir: str):
     """Returns a foreachBatch function that logs a warning (with count)
-    for any micro-batch containing invalid records, then appends them
-    to dead_letter_dir as newline-delimited JSON. Using foreachBatch
-    here (rather than a plain `.format("json")` sink) is what makes the
-    "produce a warning log" acceptance criterion possible -- a bare
-    file sink writes silently with no hook to log from."""
+    for any micro-batch containing invalid records, then appends them to
+    a UTC-date-partitioned subdirectory of dead_letter_dir
+    (dead_letter_dir/YYYY-MM-DD/, per consumers.normalizer.
+    dead_letter_output_path -- Issue #11's dead-letter path convention)
+    as newline-delimited JSON. Using foreachBatch here (rather than a
+    plain `.format("json")` sink) is what makes the "produce a warning
+    log" acceptance criterion possible -- a bare file sink writes
+    silently with no hook to log from."""
 
     def _write(batch_df: DataFrame, batch_id: int) -> None:
         batch_df.persist()
@@ -409,18 +338,20 @@ def write_dead_letter_batch(dead_letter_dir: str):
             count = batch_df.count()
             if count == 0:
                 return
+            output_path = dead_letter_output_path(dead_letter_dir)
             logger.warning(
-                "batch %d: %d invalid record(s) (unparsable JSON or missing "
-                "required field) routed to dead-letter store at %s",
+                "batch %d: %d invalid record(s) (unparsable JSON, missing "
+                "required field after normalization, or unrecognized "
+                "event source) routed to dead-letter store at %s",
                 batch_id,
                 count,
-                dead_letter_dir,
+                output_path,
             )
             (
                 batch_df.withColumn("dead_letter_batch_id", F.lit(batch_id))
                 .withColumn("dead_letter_written_at", F.current_timestamp())
                 .write.mode("append")
-                .json(dead_letter_dir)
+                .json(output_path)
             )
         finally:
             batch_df.unpersist()
@@ -432,10 +363,11 @@ CONSOLE_DISPLAY_COLUMNS = [
     "event_id",
     "timestamp",
     "event_timestamp",
+    "normalized_at",
     "source_ip",
+    "source",
     "event_type",
     "severity",
-    "source",
     "raw_message",
     "processing_lag_seconds",
     "kafka_partition",
@@ -454,7 +386,7 @@ def main() -> None:
     os.makedirs(config.dead_letter_dir, exist_ok=True)
 
     spark = build_spark_session(config)
-    spark.sparkContext.setLogLevel("WARN")  # Spark's own chatter, not ours
+    spark.sparkContext.setLogLevel("WARN")
 
     logger.info(
         "starting spark_consumer: topic=%s bootstrap=%s master=%s trigger=%s "
@@ -468,7 +400,7 @@ def main() -> None:
     )
 
     raw_df = read_kafka_stream(spark, config)
-    parsed_df = parse_and_validate(raw_df)
+    parsed_df = parse_normalize_and_validate(raw_df)
 
     valid_df = parsed_df.filter(F.col("_is_valid")).drop("_is_valid")
     invalid_df = parsed_df.filter(~F.col("_is_valid")).drop("_is_valid")
@@ -507,10 +439,6 @@ def main() -> None:
     try:
         spark.streams.awaitAnyTermination()
     finally:
-        # awaitAnyTermination() returns as soon as ONE query stops (for
-        # any reason, including an error) -- surface that error, then
-        # bring the whole job down cleanly rather than leaving the
-        # other query running unattended.
         for q in active_queries:
             if q.isActive:
                 continue
