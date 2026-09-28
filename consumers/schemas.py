@@ -49,7 +49,9 @@ def _validate_ip(value: str, field_name: str) -> str:
     try:
         ipaddress.ip_address(value)
     except ValueError as exc:
-        raise ValueError(f"{field_name!r} is not a valid IP address: {value!r}") from exc
+        raise ValueError(
+            f"{field_name!r} is not a valid IP address: {value!r}"
+        ) from exc
     return value
 
 
@@ -175,13 +177,22 @@ class AlertEvent(BaseModel):
     """
 
     alert_id: uuid.UUID = Field(default_factory=uuid.uuid4)
-    triggered_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    triggered_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     rule_name: str = Field(min_length=1)
     severity: Severity
     description: str = Field(min_length=1)
     source_ip: str
     source_event_ids: list[uuid.UUID] = Field(default_factory=list)
     status: Literal["OPEN", "ACKNOWLEDGED", "RESOLVED"] = "OPEN"
+
+    # --- Impossible-travel-specific optional fields ---
+    username: Optional[str] = None
+    login_1_country: Optional[str] = None
+    login_2_country: Optional[str] = None
+    time_delta_minutes: Optional[float] = None
+    distance_km: Optional[float] = None
 
     model_config = {"extra": "forbid"}
 
@@ -310,7 +321,9 @@ def normalize_firewall_log(raw: str) -> LogEvent:
 
     ts = datetime.fromisoformat(match.group("ts").replace("Z", "+00:00"))
     action = match.group("action")
-    event_type: EventType = "firewall_drop" if action == "DROP" else "firewall_accept"
+    event_type: EventType = (
+        "firewall_drop" if action == "DROP" else "firewall_accept"
+    )
     severity: Severity = "MEDIUM" if action == "DROP" else "INFO"
 
     return LogEvent(
@@ -375,5 +388,8 @@ def _parse_syslog_timestamp(ts: str) -> datetime:
     Parse a traditional syslog timestamp ('Sep 06 10:15:32'), which has no
     year, assuming the current year, and attach UTC as the timezone.
     """
-    parsed = datetime.strptime(f"{_CURRENT_YEAR} {ts}", "%Y %b %d %H:%M:%S")
+    parsed = datetime.strptime(
+        f"{_CURRENT_YEAR} {ts}",
+        "%Y %b %d %H:%M:%S",
+    )
     return parsed.replace(tzinfo=timezone.utc)
