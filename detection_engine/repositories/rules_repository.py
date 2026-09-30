@@ -60,7 +60,10 @@ class RulesRepository:
                 rule_name=rule.rule_name,
                 threshold=rule.threshold,
                 window_minutes=rule.window_minutes,
+                slide_minutes=rule.window_minutes,
                 enabled=rule.enabled,
+                off_hours_start=rule.off_hours_start,
+                off_hours_end=rule.off_hours_end,
             )
 
         finally:
