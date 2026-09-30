@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import time
 
 from pyspark.sql import DataFrame
 
@@ -30,7 +31,16 @@ class RuleConfig:
     threshold: int
     window_minutes: int
     slide_minutes: int
+
     enabled: bool = True
+
+    # Time-based configuration used by rules such as
+    # OffHoursLoginRule.
+    #
+    # These remain None for rules that do not require an
+    # off-hours time window.
+    off_hours_start: time | None = None
+    off_hours_end: time | None = None
 
 
 class BaseRule(ABC):
@@ -40,10 +50,14 @@ class BaseRule(ABC):
 
     @abstractmethod
     def load_config(self) -> RuleConfig:
-        """Fetch this rule's current threshold/window from the `rules` table."""
+        """Fetch this rule's current configuration from the `rules` table."""
         raise NotImplementedError
 
     @abstractmethod
-    def detect(self, events_df: DataFrame, config: RuleConfig) -> DataFrame:
+    def detect(
+        self,
+        events_df: DataFrame,
+        config: RuleConfig,
+    ) -> DataFrame:
         """Pure transformation: events in, alert rows out. No side effects."""
         raise NotImplementedError
