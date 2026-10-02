@@ -1,4 +1,6 @@
-"""ORM model for the `alerts` table — triggered detection results."""
+"""ORM model for persisted detection alerts."""
+
+from __future__ import annotations
 
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -13,90 +15,165 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import INET
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import (
+    Mapped,
+    mapped_column,
+    relationship,
+)
 
-from api.models.base import Base, TimestampMixin
-from api.models.event import VALID_SEVERITIES
+from api.models.base import (
+    Base,
+    TimestampMixin,
+)
 
 if TYPE_CHECKING:
     from api.models.rule import Rule
 
-VALID_STATUSES = ("open", "closed")
 
-
-class Alert(TimestampMixin, Base):
-    """A detection result triggered by a rule against a window of events."""
+class Alert(
+    TimestampMixin,
+    Base,
+):
+    """A detection alert persisted separately from raw events."""
 
     __tablename__ = "alerts"
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        autoincrement=True,
+    )
 
     rule_name: Mapped[str] = mapped_column(
         String(128),
-        ForeignKey("rules.rule_name", onupdate="CASCADE", ondelete="RESTRICT"),
+        ForeignKey("rules.rule_name"),
         nullable=False,
     )
 
-    source_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
-
-    severity: Mapped[str] = mapped_column(String(16), nullable=False)
-
-    triggered_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
+    source_ip: Mapped[str] = mapped_column(
+        INET,
+        nullable=False,
     )
 
-    event_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    severity: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+    )
+
+    triggered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    event_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+    )
 
     window_start: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
+        DateTime(timezone=True),
+        nullable=False,
     )
 
     window_end: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
+        DateTime(timezone=True),
+        nullable=False,
     )
 
+    # Existing SIEM lifecycle:
+    #
+    # OPEN
+    # ACKNOWLEDGED
+    # RESOLVED
+    #
     status: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="open"
+        String(16),
+        nullable=False,
+        default="OPEN",
     )
 
-    rule: Mapped["Rule"] = relationship("Rule", back_populates="alerts")
+    resolved_at: Mapped[
+        datetime | None
+    ] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    rule: Mapped["Rule"] = relationship(
+        "Rule",
+        back_populates="alerts",
+    )
 
     __table_args__ = (
         CheckConstraint(
-            f"severity IN {VALID_SEVERITIES}",
+            """
+            severity IN (
+                'INFO',
+                'MEDIUM',
+                'HIGH',
+                'CRITICAL'
+            )
+            """,
             name="ck_alerts_severity",
         ),
+
         CheckConstraint(
-            f"status IN {VALID_STATUSES}",
+            """
+            status IN (
+                'OPEN',
+                'ACKNOWLEDGED',
+                'RESOLVED'
+            )
+            """,
             name="ck_alerts_status",
         ),
+
         CheckConstraint(
             "event_count > 0",
             name="ck_alerts_event_count_positive",
         ),
+
         CheckConstraint(
             "window_end >= window_start",
             name="ck_alerts_window_order",
         ),
 
-        # Prevent duplicate alerts when Spark reprocesses
-        # the same rule/source/window.
+        # Issue #17 deduplication arbiter.
         UniqueConstraint(
-            "rule_name",
             "source_ip",
+            "rule_name",
             "window_start",
-            "window_end",
-            name="uq_alerts_rule_source_window",
+            name="uq_alerts_ip_rule_window_start",
         ),
 
-        Index("idx_alerts_triggered_at", "triggered_at"),
-        Index("idx_alerts_source_ip", "source_ip"),
-        Index("idx_alerts_status", "status"),
-        Index("idx_alerts_rule_name", "rule_name"),
+        Index(
+            "ix_alerts_triggered_at",
+            "triggered_at",
+        ),
+
+        Index(
+            "ix_alerts_source_ip",
+            "source_ip",
+        ),
+
+        Index(
+            "ix_alerts_status",
+            "status",
+        ),
+
+        Index(
+            "ix_alerts_status_severity",
+            "status",
+            "severity",
+        ),
     )
 
-    def __repr__(self) -> str:  # pragma: no cover
+    def __repr__(self) -> str:
         return (
-            f"<Alert id={self.id} rule_name={self.rule_name!r} "
-            f"status={self.status!r} triggered_at={self.triggered_at}>"
+            f"<Alert "
+            f"id={self.id} "
+            f"rule_name={self.rule_name!r} "
+            f"source_ip={self.source_ip!r} "
+            f"severity={self.severity!r} "
+            f"status={self.status!r}>"
         )

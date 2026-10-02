@@ -174,14 +174,16 @@ class TestSchemaParity:
                 {
                     "id", "rule_name", "source_ip", "severity", "triggered_at",
                     "event_count", "window_start", "window_end", "status",
-                    "created_at", "updated_at",
+                    "resolved_at", "created_at", "updated_at",
                 },
             ),
             (
                 "rules",
                 {
                     "id", "rule_name", "description", "threshold",
-                    "window_minutes", "enabled", "created_at", "updated_at",
+                    "window_minutes", "enabled", "off_hours_start",
+                    "off_hours_end", "dedup_window_minutes",
+                    "created_at", "updated_at",
                 },
             ),
         ],
@@ -339,6 +341,20 @@ class TestRule:
         assert fetched.threshold == 5
         assert fetched.window_minutes == 10
         assert fetched.enabled is True
+        assert fetched.dedup_window_minutes == 10
+
+    @pytest.mark.parametrize("dedup_window", [0, -1])
+    def test_non_positive_dedup_window_rejected(self, session, dedup_window):
+        session.add(
+            Rule(
+                rule_name=f"r_{uuid.uuid4().hex[:8]}",
+                threshold=5,
+                window_minutes=10,
+                dedup_window_minutes=dedup_window,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.flush()
 
     def test_rule_name_unique(self, session, rule):
         session.add(Rule(rule_name=rule.rule_name, threshold=1, window_minutes=1))
@@ -384,7 +400,7 @@ class TestAlert:
         session.flush()
 
         fetched = session.get(Alert, alert.id)
-        assert fetched.status == "open"
+        assert fetched.status == "OPEN"
         assert fetched.event_count == 7
 
     def test_relationship_to_rule_resolves(self, session, rule):
@@ -400,12 +416,12 @@ class TestAlert:
         with pytest.raises(IntegrityError):
             session.flush()
 
-    @pytest.mark.parametrize("status", ["open", "closed"])
+    @pytest.mark.parametrize("status", ["OPEN", "ACKNOWLEDGED", "RESOLVED"])
     def test_accepts_valid_statuses(self, session, rule, status):
         session.add(make_alert(rule.rule_name, status=status))
         session.flush()
 
-    @pytest.mark.parametrize("status", ["OPEN", "resolved", "pending", ""])
+    @pytest.mark.parametrize("status", ["open", "closed", "resolved", "pending", ""])
     def test_rejects_invalid_status(self, session, rule, status):
         session.add(make_alert(rule.rule_name, status=status))
         with pytest.raises((IntegrityError, DataError)):

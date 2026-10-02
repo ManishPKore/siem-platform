@@ -1,4 +1,6 @@
-"""ORM model for the `rules` table — configurable detection rule parameters."""
+"""ORM model for configurable detection rules."""
+
+from __future__ import annotations
 
 from datetime import time
 from typing import TYPE_CHECKING
@@ -13,7 +15,7 @@ if TYPE_CHECKING:
 
 
 class Rule(TimestampMixin, Base):
-    """A configurable detection rule (e.g. brute-force threshold)."""
+    """Configurable detection rule parameters."""
 
     __tablename__ = "rules"
 
@@ -49,9 +51,6 @@ class Rule(TimestampMixin, Base):
         default=True,
     )
 
-    # Time-based configuration used by rules such as
-    # OffHoursLoginRule. These fields remain NULL for rules
-    # that do not require an off-hours window.
     off_hours_start: Mapped[time | None] = mapped_column(
         Time,
         nullable=True,
@@ -60,6 +59,12 @@ class Rule(TimestampMixin, Base):
     off_hours_end: Mapped[time | None] = mapped_column(
         Time,
         nullable=True,
+    )
+
+    dedup_window_minutes: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=10,
     )
 
     alerts: Mapped[list["Alert"]] = relationship(
@@ -78,6 +83,10 @@ class Rule(TimestampMixin, Base):
             name="ck_rules_window_positive",
         ),
         CheckConstraint(
+            "dedup_window_minutes > 0",
+            name="ck_rules_dedup_window_positive",
+        ),
+        CheckConstraint(
             """
             (
                 off_hours_start IS NULL
@@ -93,8 +102,9 @@ class Rule(TimestampMixin, Base):
         ),
     )
 
-    def __repr__(self) -> str:  # pragma: no cover
+    def __repr__(self) -> str:
         return (
-            f"<Rule id={self.id} rule_name={self.rule_name!r} "
+            f"<Rule id={self.id} "
+            f"rule_name={self.rule_name!r} "
             f"enabled={self.enabled}>"
         )

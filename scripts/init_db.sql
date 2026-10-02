@@ -30,14 +30,16 @@ CREATE TABLE IF NOT EXISTS users (
 -- rules  (detection rule configuration)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS rules (
-    id              BIGSERIAL PRIMARY KEY,
-    rule_name       VARCHAR(128) NOT NULL UNIQUE,
-    description     TEXT,
-    threshold       INTEGER      NOT NULL CHECK (threshold > 0),
-    window_minutes  INTEGER      NOT NULL CHECK (window_minutes > 0),
-    enabled         BOOLEAN      NOT NULL DEFAULT TRUE,
-    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
+    id                    BIGSERIAL PRIMARY KEY,
+    rule_name             VARCHAR(128) NOT NULL UNIQUE,
+    description           TEXT,
+    threshold             INTEGER      NOT NULL CHECK (threshold > 0),
+    window_minutes        INTEGER      NOT NULL CHECK (window_minutes > 0),
+    enabled               BOOLEAN      NOT NULL DEFAULT TRUE,
+    dedup_window_minutes  INTEGER      NOT NULL DEFAULT 10
+                            CHECK (dedup_window_minutes > 0),
+    created_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
 -- ---------------------------------------------------------------------------
@@ -75,26 +77,46 @@ CREATE TABLE IF NOT EXISTS alerts (
     event_count     INTEGER      NOT NULL CHECK (event_count > 0),
     window_start    TIMESTAMPTZ  NOT NULL,
     window_end      TIMESTAMPTZ  NOT NULL,
-    status          VARCHAR(16)  NOT NULL DEFAULT 'open'
-                        CHECK (status IN ('open', 'closed')),
+    status          VARCHAR(16)  NOT NULL DEFAULT 'OPEN'
+                        CHECK (status IN ('OPEN', 'ACKNOWLEDGED', 'RESOLVED')),
+    resolved_at     TIMESTAMPTZ,
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    CHECK (window_end >= window_start)
+    CHECK (window_end >= window_start),
+    CONSTRAINT uq_alerts_ip_rule_window_start
+        UNIQUE (source_ip, rule_name, window_start)
 );
 
 -- ---------------------------------------------------------------------------
 -- Indexes (query performance)
 -- ---------------------------------------------------------------------------
-CREATE INDEX IF NOT EXISTS idx_events_timestamp   ON events ("timestamp");
-CREATE INDEX IF NOT EXISTS idx_events_source_ip    ON events (source_ip);
-CREATE INDEX IF NOT EXISTS idx_events_event_type   ON events (event_type);
--- Speeds up ad-hoc queries/containment checks against enrichment data.
-CREATE INDEX IF NOT EXISTS idx_events_metadata_gin ON events USING GIN (metadata);
+CREATE INDEX IF NOT EXISTS idx_events_timestamp
+    ON events ("timestamp");
 
-CREATE INDEX IF NOT EXISTS idx_alerts_triggered_at ON alerts (triggered_at);
-CREATE INDEX IF NOT EXISTS idx_alerts_source_ip    ON alerts (source_ip);
-CREATE INDEX IF NOT EXISTS idx_alerts_status        ON alerts (status);
-CREATE INDEX IF NOT EXISTS idx_alerts_rule_name     ON alerts (rule_name);
+CREATE INDEX IF NOT EXISTS idx_events_source_ip
+    ON events (source_ip);
+
+CREATE INDEX IF NOT EXISTS idx_events_event_type
+    ON events (event_type);
+
+-- Speeds up ad-hoc queries/containment checks against enrichment data.
+CREATE INDEX IF NOT EXISTS idx_events_metadata_gin
+    ON events USING GIN (metadata);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_triggered_at
+    ON alerts (triggered_at);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_source_ip
+    ON alerts (source_ip);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_status
+    ON alerts (status);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_rule_name
+    ON alerts (rule_name);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_status_severity
+    ON alerts (status, severity);
 
 -- ---------------------------------------------------------------------------
 -- updated_at auto-touch trigger (users, rules, alerts)

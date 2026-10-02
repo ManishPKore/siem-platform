@@ -12,8 +12,15 @@ import os
 from contextlib import contextmanager
 from typing import Iterator
 
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+
+
+# Load .env only when explicitly requested for local development.
+# Docker Compose supplies environment variables directly.
+if os.environ.get("SIEM_LOAD_DOTENV", "").lower() == "true":
+    load_dotenv()
 
 
 POSTGRES_URL = os.environ.get("POSTGRES_URL")
