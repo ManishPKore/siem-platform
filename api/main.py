@@ -25,7 +25,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 from api.database import engine
-from api.routers import events, health
+from api.routers import alerts, events, health
 
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(
         title="SIEM Platform API",
-        description="Query API for normalized security events.",
+        description="Query API for normalized security events and alerts.",
         version="0.1.0",
         lifespan=lifespan,
     )
@@ -73,8 +73,15 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Health endpoints.
     app.include_router(health.router)
+
+    # Security event endpoints.
     app.include_router(events.router, prefix="/api")
+
+    # Alert endpoints.
+    # The alerts router defines its own prefix.
+    app.include_router(alerts.router)
 
     return app
 
