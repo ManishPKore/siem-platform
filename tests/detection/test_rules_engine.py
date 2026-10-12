@@ -47,6 +47,9 @@ from detection_engine.rules_engine import (
     RuleLoadError,
     RulesEngine,
     RulesEngineError,
+    _as_utc,
+    config_from_row,
+    discover_rules,
 )
 
 
@@ -1705,3 +1708,173 @@ def test_stop_without_running_query_is_safe():
     engine.stop()
 
     assert engine.is_running is False
+
+# ---------------------------------------------------------------------------
+# Utility function coverage
+# ---------------------------------------------------------------------------
+
+
+def test_config_from_row_converts_enabled_to_boolean():
+    row = make_rule_row(
+        "brute_force",
+        enabled=1,
+        threshold=10,
+        window_minutes=15,
+    )
+
+    config = config_from_row(row)
+
+    assert config.rule_name == "brute_force"
+    assert config.threshold == 10
+    assert config.window_minutes == 15
+    assert config.slide_minutes == 15
+    assert config.enabled is True
+
+
+def test_config_from_row_handles_missing_optional_attributes():
+    from types import SimpleNamespace
+
+    row = SimpleNamespace(
+        rule_name="brute_force",
+        threshold=5,
+        window_minutes=10,
+        enabled=False,
+    )
+
+    config = config_from_row(row)
+
+    assert config.rule_name == "brute_force"
+    assert config.enabled is False
+    assert config.off_hours_start is None
+    assert config.off_hours_end is None
+
+
+@pytest.mark.parametrize("timestamp", [0, 1767225600, 1767225600.5])
+def test_as_utc_converts_epoch_timestamp(timestamp):
+    result = _as_utc(timestamp)
+
+    assert isinstance(result, datetime)
+    assert result.tzinfo == timezone.utc
+    assert result.timestamp() == pytest.approx(timestamp)
+
+
+def test_as_utc_rejects_none():
+    with pytest.raises(ValueError, match="triggered_at cannot be None"):
+        _as_utc(None)
+
+
+def test_discover_rules_rejects_non_package():
+    """A module without ``__path__`` must be rejected as a package."""
+    with pytest.raises(RuleLoadError):
+        discover_rules("detection_engine.rules_engine")
+
+# ---------------------------------------------------------------------------
+# Additional coverage: rule loading and error handling
+# ---------------------------------------------------------------------------
+
+
+def test_rule_factory_returns_invalid_object_in_non_strict_mode(caplog):
+    """A factory returning a non-BaseRule object should skip that rule."""
+    repository = Mock()
+    repository.list_enabled.return_value = [
+        make_rule_row("test_rule_one"),
+    ]
+
+    engine = make_engine(
+        repository,
+        rule_factory=lambda rule_class, config: object(),
+    )
+
+    assert engine.active_rule_names == ()
+    assert "test_rule_one" in caplog.text
+
+
+def test_rule_factory_failure_in_non_strict_mode(caplog):
+    """A factory exception should not prevent other rules from loading."""
+    repository = Mock()
+    repository.list_enabled.return_value = [
+        make_rule_row("test_rule_one"),
+        make_rule_row("test_rule_two"),
+    ]
+
+    def factory(rule_class, config):
+        if rule_class.rule_name == "test_rule_one":
+            raise RuntimeError("intentional factory failure")
+        return rule_class(config)
+
+    engine = make_engine(
+        repository,
+        rule_factory=factory,
+    )
+
+    assert engine.active_rule_names == ("test_rule_two",)
+
+    result = engine.reload_rules(restart_query=False)
+
+    assert result.failed == ("test_rule_one",)
+    assert result.loaded == ("test_rule_two",)
+
+
+def test_empty_initial_rule_set_logs_warning(caplog):
+    """Startup with no active rules should warn that the stream is empty."""
+    repository = Mock()
+    repository.list_enabled.return_value = []
+
+    with caplog.at_level("WARNING"):
+        engine = make_engine(repository)
+
+    assert engine.active_rule_names == ()
+    assert "loaded 0 detection rules" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: query lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_stop_stops_active_query():
+    """Stopping the engine should stop an active query and clear its state."""
+    repository = Mock()
+    repository.list_enabled.return_value = []
+
+    engine = make_engine(repository)
+
+    query = Mock()
+    query.isActive = True
+
+    engine._query = query
+    engine._query_spec = Mock()
+
+    engine.stop()
+
+    query.stop.assert_called_once_with()
+    assert engine._query is None
+    assert engine._query_spec is None
+    assert engine.is_running is False
+
+
+def test_restart_query_clears_query_spec_when_launch_fails():
+    """A failed query restart should clear the saved query specification."""
+    repository = Mock()
+    repository.list_enabled.return_value = []
+
+    engine = make_engine(repository)
+
+    query_spec = Mock()
+    old_query = Mock()
+    old_query.isActive = False
+
+    engine._query_spec = query_spec
+    engine._query = old_query
+    engine._launch = Mock(
+        side_effect=RuntimeError("intentional restart failure")
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="intentional restart failure",
+    ):
+        engine._restart_query()
+
+    engine._launch.assert_called_once_with(query_spec)
+    assert engine._query_spec is None
