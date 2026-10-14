@@ -9,3 +9,4 @@ faker>=20.0.0
 pyspark==3.5.1
 pandas==2.3.3
 pyarrow==23.0.1
+elasticsearch>=8.13,<9
