@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""Initialize the siem-events Elasticsearch index.
+"""Initialize Elasticsearch for the SIEM: ILM policy, index template, write alias.
 
-The script is idempotent. Existing indices are verified and left unchanged
-unless --recreate is supplied.
+The script is idempotent. An existing, correctly configured setup is verified
+and left unchanged unless --recreate is supplied.
+
+What it provisions (definitions live in scripts/es_mapping.py):
+    * ILM policy      siem-events-policy    (hot rollover -> delete after 7 days)
+    * Index template  siem-events-template  (strict mapping, applies to siem-events-*)
+    * Bootstrap index siem-events-000001 with write alias `siem-events`
 
 Usage:
     python scripts/init_es.py
-    python scripts/init_es.py --host http://localhost:9200
+    python scripts/init_es.py --host http://localhost:9200 --replicas 0
     python scripts/init_es.py --recreate
 
 Environment:
-    ES_HOST: Elasticsearch URL (default: http://localhost:9200)
+    ES_HOST (or ES_URL): Elasticsearch URL (default: http://localhost:9200)
+
+Legacy note:
+    Earlier versions created a concrete index named `siem-events`. An alias cannot
+    share a name with an index, so that index blocks setup until it is removed.
+    --recreate deletes it (and every index behind the alias): DATA LOSS, dev only.
 """
 
 from __future__ import annotations
@@ -30,37 +40,20 @@ from elasticsearch import (
     Elasticsearch,
 )
 
+from es_mapping import (
+    ALIAS,
+    EXPECTED_FIELD_TYPES,
+    FIRST_INDEX,
+    ILM_POLICY,
+    MAPPINGS,
+    POLICY_NAME,
+    TEMPLATE_NAME,
+    build_template,
+)
+
 logger = logging.getLogger("init_es")
 
 DEFAULT_HOST = "http://localhost:9200"
-INDEX_NAME = "siem-events"
-
-INDEX_BODY: dict[str, Any] = {
-    "settings": {
-        "number_of_shards": 1,
-        "number_of_replicas": 0,
-        "refresh_interval": "5s",
-    },
-    "mappings": {
-        "dynamic": "false",
-        "properties": {
-            "timestamp": {
-                "type": "date",
-                "format": "strict_date_optional_time||epoch_millis",
-            },
-            "source_ip": {"type": "keyword"},
-            "event_type": {"type": "keyword"},
-            "severity": {"type": "keyword"},
-            "country": {"type": "keyword"},
-            "raw_message": {"type": "text"},
-        },
-    },
-}
-
-EXPECTED_TYPES = {
-    name: spec["type"]
-    for name, spec in INDEX_BODY["mappings"]["properties"].items()
-}
 
 
 def wait_for_cluster(
@@ -118,48 +111,103 @@ def wait_for_cluster(
     ) from last_error
 
 
+def ensure_ilm_policy(client: Elasticsearch) -> None:
+    """Create or update the ILM policy (PUT is idempotent)."""
+    client.ilm.put_lifecycle(name=POLICY_NAME, policy=ILM_POLICY)
+    logger.info("ILM policy '%s' applied", POLICY_NAME)
+
+
+def ensure_index_template(client: Elasticsearch, replicas: int = 0) -> None:
+    """Create or update the composable index template (PUT is idempotent)."""
+    client.indices.put_index_template(
+        name=TEMPLATE_NAME,
+        **build_template(replicas=replicas),
+    )
+    logger.info("Index template '%s' applied", TEMPLATE_NAME)
+
+
+def _alias_indices(client: Elasticsearch, alias: str = ALIAS) -> dict[str, Any]:
+    """Return {backing_index: alias_info} for the alias."""
+    response = client.indices.get_alias(name=alias)
+    return {name: response[name] for name in response}
+
+
+def get_write_index(client: Elasticsearch, alias: str = ALIAS) -> str:
+    """Return the index that currently receives writes for the alias."""
+    indices = _alias_indices(client, alias)
+
+    for name, info in indices.items():
+        if info.get("aliases", {}).get(alias, {}).get("is_write_index"):
+            return name
+
+    if len(indices) == 1:
+        return next(iter(indices))
+
+    raise RuntimeError(
+        f"Alias '{alias}' has no write index among {sorted(indices)}"
+    )
+
+
 def verify_mapping(
     client: Elasticsearch,
     index: str,
+    replicas: int = 0,
 ) -> list[str]:
-    """Return human-readable differences from the expected index mapping."""
-    response = client.indices.get_mapping(index=index)
-    mappings = response[index]["mappings"]
+    """Return human-readable differences from the expected configuration."""
+    mappings = client.indices.get_mapping(index=index)[index]["mappings"]
+    props = mappings.get("properties", {})
 
     problems: list[str] = []
-    actual_properties = mappings.get("properties", {})
 
-    for field, expected_type in EXPECTED_TYPES.items():
-        actual_type = actual_properties.get(field, {}).get("type")
+    for field, expected_type in EXPECTED_FIELD_TYPES.items():
+        actual_type = props.get(field, {}).get("type")
 
         if actual_type != expected_type:
             problems.append(
                 f"{field}: expected {expected_type}, found {actual_type}"
             )
 
-    expected_dynamic = INDEX_BODY["mappings"]["dynamic"]
+    expected_dynamic = MAPPINGS["dynamic"]
 
-    if mappings.get("dynamic", True) != expected_dynamic:
+    if mappings.get("dynamic") != expected_dynamic:
         problems.append(
             f"dynamic: expected {expected_dynamic}, "
-            f"found {mappings.get('dynamic', True)}"
+            f"found {mappings.get('dynamic')}"
         )
+
+    expected_format = MAPPINGS["properties"]["timestamp"]["format"]
+    actual_format = props.get("timestamp", {}).get("format")
+
+    if actual_format != expected_format:
+        problems.append(
+            f"timestamp.format: expected {expected_format}, found {actual_format}"
+        )
+
+    for field in ("raw_message", "severity"):
+        sub_type = (
+            props.get(field, {}).get("fields", {}).get("keyword", {}).get("type")
+        )
+
+        if sub_type != "keyword":
+            problems.append(
+                f"{field}.keyword: expected keyword, found {sub_type}"
+            )
 
     settings = client.indices.get_settings(
         index=index,
         flat_settings=True,
-    )
+    )[index].get("settings", {})
 
-    actual_settings = settings[index].get("settings", {})
-    expected_settings = INDEX_BODY["settings"]
+    expected_settings = {
+        "index.number_of_replicas": replicas,
+        "index.lifecycle.name": POLICY_NAME,
+        "index.lifecycle.rollover_alias": ALIAS,
+    }
 
     for setting, expected_value in expected_settings.items():
-        actual_value = actual_settings.get(f"index.{setting}")
+        actual_value = settings.get(setting)
 
-        if (
-            actual_value is not None
-            and str(actual_value) != str(expected_value)
-        ):
+        if actual_value is None or str(actual_value) != str(expected_value):
             problems.append(
                 f"{setting}: expected {expected_value}, found {actual_value}"
             )
@@ -167,80 +215,108 @@ def verify_mapping(
     return problems
 
 
-def ensure_index(
-    client: Elasticsearch,
-    index: str = INDEX_NAME,
-    recreate: bool = False,
-) -> bool:
-    """Create the index if necessary; return True when this call creates it."""
-    exists = client.indices.exists(index=index)
+def verify_ilm(client: Elasticsearch) -> None:
+    """Raise unless ILM manages every backing index with the expected policy."""
+    for index in _alias_indices(client):
+        info = client.ilm.explain_lifecycle(index=index)["indices"][index]
 
-    if exists and recreate:
-        logger.warning(
-            "Deleting existing index '%s' because --recreate was supplied",
-            index,
-        )
-        client.indices.delete(index=index)
-        exists = False
-
-    if exists:
-        problems = verify_mapping(client, index)
-
-        if problems:
+        if not info.get("managed") or info.get("policy") != POLICY_NAME:
             raise RuntimeError(
-                f"Index '{index}' has an incompatible configuration: "
-                + "; ".join(problems)
-                + ". Use --recreate only if deleting existing index data "
-                "is acceptable."
+                f"ILM is not managing '{index}' with '{POLICY_NAME}': {info}"
             )
 
         logger.info(
-            "Index '%s' already exists with the expected configuration",
+            "ILM OK: '%s' managed by '%s' (phase=%s)",
             index,
+            POLICY_NAME,
+            info.get("phase"),
+        )
+
+
+def _raise_if_incompatible(client: Elasticsearch, replicas: int, context: str) -> None:
+    index = get_write_index(client)
+    problems = verify_mapping(client, index, replicas)
+
+    if problems:
+        raise RuntimeError(
+            f"{context} '{index}' has an incompatible configuration: "
+            + "; ".join(problems)
+            + ". Roll over to pick up the current template "
+            "(POST siem-events/_rollover) or use --recreate only if deleting "
+            "existing index data is acceptable."
+        )
+
+
+def ensure_index(
+    client: Elasticsearch,
+    replicas: int = 0,
+    recreate: bool = False,
+) -> bool:
+    """Ensure the write alias and first backing index exist.
+
+    Returns True when this call creates the bootstrap index.
+    """
+    alias_exists = bool(client.indices.exists_alias(name=ALIAS))
+
+    if alias_exists and recreate:
+        for name in list(_alias_indices(client)):
+            logger.warning(
+                "Deleting index '%s' because --recreate was supplied", name
+            )
+            client.indices.delete(index=name)
+        alias_exists = False
+
+    if alias_exists:
+        _raise_if_incompatible(client, replicas, "Write index")
+        logger.info(
+            "Alias '%s' already exists with the expected configuration", ALIAS
         )
         return False
 
+    if client.indices.exists(index=ALIAS):
+        # A concrete (legacy) index occupies the alias name.
+        if not recreate:
+            raise RuntimeError(
+                f"A legacy concrete index named '{ALIAS}' exists and blocks the "
+                "write alias. Reindex it into "
+                f"'{FIRST_INDEX}' or use --recreate if deleting its data is "
+                "acceptable."
+            )
+
+        logger.warning(
+            "Deleting legacy index '%s' because --recreate was supplied", ALIAS
+        )
+        client.indices.delete(index=ALIAS)
+
     try:
         client.indices.create(
-            index=index,
-            settings=INDEX_BODY["settings"],
-            mappings=INDEX_BODY["mappings"],
+            index=FIRST_INDEX,
+            aliases={ALIAS: {"is_write_index": True}},
         )
 
     except BadRequestError as exc:
         # Another process may have created the index between the existence
         # check and the create operation. Inspect the structured error body
         # because exc.error contains the message, not necessarily the error type.
-        error_body = (
-            exc.body.get("error", {})
-            if isinstance(exc.body, dict)
-            else {}
-        )
-
-        error_type = (
-            error_body.get("type")
-            if isinstance(error_body, dict)
-            else None
-        )
+        error_body = exc.body.get("error", {}) if isinstance(exc.body, dict) else {}
+        error_type = error_body.get("type") if isinstance(error_body, dict) else None
 
         if error_type == "resource_already_exists_exception":
-            logger.info("Index '%s' was created concurrently", index)
+            logger.info("Index '%s' was created concurrently", FIRST_INDEX)
 
-            # Verify the concurrently created index before treating the
-            # operation as successful.
-            problems = verify_mapping(client, index)
-
-            if problems:
+            try:
+                _raise_if_incompatible(client, replicas, "Concurrently created index")
+            except RuntimeError as inner:
                 raise RuntimeError(
                     f"Concurrent index creation produced an incompatible "
-                    f"configuration: {'; '.join(problems)}"
+                    f"configuration: {inner}"
                 ) from exc
 
             return False
 
         raise
 
-    logger.info("Created index '%s'", index)
+    logger.info("Created '%s' with write alias '%s'", FIRST_INDEX, ALIAS)
     return True
 
 
@@ -250,20 +326,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument(
         "--host",
-        default=os.getenv("ES_HOST", DEFAULT_HOST),
-        help="Elasticsearch URL; defaults to ES_HOST or localhost:9200",
+        default=os.getenv("ES_HOST") or os.getenv("ES_URL") or DEFAULT_HOST,
+        help="Elasticsearch URL; defaults to ES_HOST/ES_URL or localhost:9200",
     )
 
     parser.add_argument(
-        "--index",
-        default=INDEX_NAME,
-        help="Index name (default: siem-events)",
+        "--replicas",
+        type=int,
+        default=0,
+        help="Replica count; 0 for the single-node Docker stack (default: 0)",
     )
 
     parser.add_argument(
         "--recreate",
         action="store_true",
-        help="Delete and recreate the index; existing index data will be lost",
+        help="Delete the alias's indices (and any legacy 'siem-events' index) "
+        "and recreate; existing data will be lost",
     )
 
     parser.add_argument(
@@ -277,7 +355,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the Elasticsearch index initialization."""
+    """Run the Elasticsearch initialization."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -297,14 +375,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         wait_for_cluster(client, args.wait_timeout)
+        ensure_ilm_policy(client)
+        ensure_index_template(client, replicas=args.replicas)
+        ensure_index(client, replicas=args.replicas, recreate=args.recreate)
+        verify_ilm(client)
 
-        ensure_index(
-            client,
-            index=args.index,
-            recreate=args.recreate,
-        )
-
-        logger.info("Elasticsearch index initialization completed")
+        logger.info("Elasticsearch initialization completed")
         return 0
 
     except TimeoutError as exc:
