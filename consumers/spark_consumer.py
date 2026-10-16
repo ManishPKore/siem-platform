@@ -147,6 +147,10 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from consumers.log_consumer import DEFAULT_TOPIC
+from api.services.spark_dual_sink import (
+    build_dual_sink_writer,
+    write_valid_events_batch,
+)
 
 from consumers.normalizer import (
     RAW_EVENT_SCHEMA,
@@ -405,11 +409,12 @@ def main() -> None:
     valid_df = parsed_df.filter(F.col("_is_valid")).drop("_is_valid")
     invalid_df = parsed_df.filter(~F.col("_is_valid")).drop("_is_valid")
 
-    console_query = (
-        valid_df.select(*CONSOLE_DISPLAY_COLUMNS)
-        .writeStream.format("console")
+    dual_writer = build_dual_sink_writer()
+
+    valid_query = (
+        valid_df.writeStream
+        .foreachBatch(write_valid_events_batch(dual_writer))
         .outputMode("append")
-        .option("truncate", "false")
         .option("checkpointLocation", config.console_checkpoint_dir)
         .trigger(processingTime=config.trigger_interval)
         .start()
@@ -425,7 +430,7 @@ def main() -> None:
         .start()
     )
 
-    active_queries = [console_query, dead_letter_query]
+    active_queries = [valid_query, dead_letter_query]
 
     def _handle_shutdown(signum, frame) -> None:
         logger.info("received signal %s, stopping streaming queries...", signum)
@@ -448,6 +453,7 @@ def main() -> None:
         for q in active_queries:
             if q.isActive:
                 q.stop()
+        dual_writer.close()
         spark.stop()
         logger.info("spark_consumer stopped")
 

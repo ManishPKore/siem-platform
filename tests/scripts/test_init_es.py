@@ -88,12 +88,32 @@ def _client(alias_exists=True, concrete_exists=False):
 def test_mapping_has_required_fields_and_types():
     expected = init_es.EXPECTED_FIELD_TYPES
 
-    for field in ("source_ip", "event_type", "severity", "country", "username"):
-        assert expected[field] == "keyword"
+    keyword_fields = (
+        "source_ip",
+        "event_type",
+        "severity",
+        "country",
+        "username",
+        "auth_method",
+        "method",
+        "path",
+        "user_agent",
+        "action",
+        "protocol",
+    )
+
+    for field in keyword_fields:
+        assert expected[field] == "keyword", (
+            f"{field} should be mapped as keyword"
+        )
 
     assert expected["timestamp"] == "date"
     assert expected["raw_message"] == "text"
     assert expected["location"] == "geo_point"
+    assert expected["success"] == "boolean"
+    assert expected["status_code"] == "integer"
+    assert expected["bytes_sent"] == "long"
+
 
 
 def test_ilm_policy_deletes_after_seven_days():
