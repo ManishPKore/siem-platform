@@ -19,10 +19,21 @@ Kafka
     ↓
 Normalization
     ↓
-Detection Engine
+Enrichment (GeoIP)
     ↓
-Enrichment
+Detection Engine
     ↓
 Storage
     ↓
 API / Dashboards
+```
+
+## Enrichment
+
+GeoIP enrichment (`enrichment/`) runs inside the Spark pipeline between
+normalization and detection. `enrichment.spark_enrichment.add_geoip_columns()`
+adds `geo_country`, `geo_city`, `geo_latitude`, `geo_longitude` and
+`geo_is_private` to every valid event, looked up in a local MaxMind
+GeoLite2-City database. Detection rules read the `geo_*` columns (impossible
+travel needs the coordinates); the storage sinks persist them as `country`,
+`city` and `location` (see `api/services/spark_dual_sink.py`).

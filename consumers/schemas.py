@@ -99,6 +99,14 @@ class LogEvent(BaseModel):
     dest_port: Optional[int] = Field(default=None, ge=0, le=65535)
     protocol: Optional[str] = None
 
+    # --- GeoIP enrichment (optional; populated by enrichment/, which runs
+    # between normalization and detection. latitude/longitude become the
+    # Elasticsearch `location` geo_point in ElasticsearchStorageService) ---
+    country: Optional[str] = None
+    city: Optional[str] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+
     model_config = {"extra": "forbid"}
 
     # -- validators --------------------------------------------------

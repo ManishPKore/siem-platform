@@ -10,3 +10,5 @@ pyspark==3.5.1
 pandas==2.3.3
 pyarrow==23.0.1
 elasticsearch>=8.13,<9
+geoip2>=4.8,<6
+python-dotenv
