@@ -9,8 +9,10 @@ into the canonical schema from Issue #6 (consumers/schemas.py -- see
 consumers/normalizer.py, Issue #11), validates the normalized result, and
 fans out into two sinks:
 
-    * valid records   -> console sink (stdout), for now -- this will be
-      swapped for the enrichment/detection sinks in a later issue.
+    * valid records   -> GeoIP enrichment (enrichment/spark_enrichment.py:
+      adds geo_country / geo_city / geo_latitude / geo_longitude /
+      geo_is_private, the columns detection rules such as
+      impossible_travel read) -> PostgreSQL + Elasticsearch dual sink.
     * invalid records (unparsable JSON, missing/blank required fields
       after normalization, or an unrecognized raw `event_type` that
       normalize_event() couldn't map to a known source) -> an
@@ -87,6 +89,12 @@ Configuration (environment variables)
     SPARK_FAIL_ON_DATA_LOSS         default "false" (see inline comment
                                      on the Kafka source options below)
     SPARK_MAX_OFFSETS_PER_TRIGGER   optional; unset = no cap
+    GEOIP_DB_PATH                   default "data/GeoLite2-City.mmdb" (see
+                                     README "GeoIP Database Setup"). If the
+                                     file is missing the job still runs:
+                                     private IPs are flagged, public IPs get
+                                     null geo fields, and a warning is logged
+                                     at startup.
 
 Checkpointing & recovery
 -------------------------
@@ -147,6 +155,8 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from consumers.log_consumer import DEFAULT_TOPIC
+from enrichment.geoip import resolve_db_path
+from enrichment.spark_enrichment import add_geoip_columns
 from api.services.spark_dual_sink import (
     build_dual_sink_writer,
     write_valid_events_batch,
@@ -248,12 +258,30 @@ class SparkConsumerConfig:
 # --------------------------------------------------------------------------- #
 
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _executor_python_path() -> str:
+    """Repo root (plus any existing PYTHONPATH) for Spark's Python workers.
+
+    Python UDFs -- enrichment/spark_enrichment.py's GeoIP pandas_udf -- run in
+    worker processes that must be able to `import enrichment`. Locally they
+    inherit the driver's environment, but on the docker-compose Spark cluster
+    they are spawned by the worker daemon, which has no PYTHONPATH. The repo
+    is bind-mounted at the same path in every container, so pointing workers
+    at REPO_ROOT makes both setups behave the same.
+    """
+    existing = os.environ.get("PYTHONPATH")
+    return os.pathsep.join(p for p in (REPO_ROOT, existing) if p)
+
+
 def build_spark_session(config: SparkConsumerConfig) -> SparkSession:
     return (
         SparkSession.builder.appName(config.app_name)
         .master(config.master)
         .config("spark.jars.packages", KAFKA_CONNECTOR_PACKAGE)
         .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.executorEnv.PYTHONPATH", _executor_python_path())
         .getOrCreate()
     )
 
@@ -403,59 +431,95 @@ def main() -> None:
         config.dead_letter_dir,
     )
 
-    raw_df = read_kafka_stream(spark, config)
-    parsed_df = parse_normalize_and_validate(raw_df)
-
-    valid_df = parsed_df.filter(F.col("_is_valid")).drop("_is_valid")
-    invalid_df = parsed_df.filter(~F.col("_is_valid")).drop("_is_valid")
-
-    dual_writer = build_dual_sink_writer()
-
-    valid_query = (
-        valid_df.writeStream
-        .foreachBatch(write_valid_events_batch(dual_writer))
-        .outputMode("append")
-        .option("checkpointLocation", config.console_checkpoint_dir)
-        .trigger(processingTime=config.trigger_interval)
-        .start()
-    )
-
-    dead_letter_query = (
-        invalid_df.writeStream.foreachBatch(
-            write_dead_letter_batch(config.dead_letter_dir)
-        )
-        .outputMode("append")
-        .option("checkpointLocation", config.dead_letter_checkpoint_dir)
-        .trigger(processingTime=config.trigger_interval)
-        .start()
-    )
-
-    active_queries = [valid_query, dead_letter_query]
-
-    def _handle_shutdown(signum, frame) -> None:
-        logger.info("received signal %s, stopping streaming queries...", signum)
-        for q in active_queries:
-            if q.isActive:
-                q.stop()
-
-    signal.signal(signal.SIGINT, _handle_shutdown)
-    signal.signal(signal.SIGTERM, _handle_shutdown)
+    dual_writer = None
+    active_queries = []
 
     try:
+        raw_df = read_kafka_stream(spark, config)
+        parsed_df = parse_normalize_and_validate(raw_df)
+
+        valid_df = parsed_df.filter(F.col("_is_valid")).drop("_is_valid")
+        invalid_df = parsed_df.filter(~F.col("_is_valid")).drop("_is_valid")
+
+        # GeoIP enrichment sits between normalization and detection/storage.
+        # Only valid rows are enriched; dead-letter rows are written as-is.
+        geoip_db = resolve_db_path()
+        if not geoip_db.is_file():
+            logger.warning(
+                "GeoIP database not found at %s -- public IPs will not be "
+                "enriched (see README 'GeoIP Database Setup')",
+                geoip_db,
+            )
+        enriched_df = add_geoip_columns(valid_df, ip_col="source_ip")
+
+        dual_writer = build_dual_sink_writer()
+
+        valid_query = (
+            enriched_df.writeStream
+            .foreachBatch(write_valid_events_batch(dual_writer))
+            .outputMode("append")
+            .option("checkpointLocation", config.console_checkpoint_dir)
+            .trigger(processingTime=config.trigger_interval)
+            .start()
+        )
+        active_queries.append(valid_query)
+
+        dead_letter_query = (
+            invalid_df.writeStream.foreachBatch(
+                write_dead_letter_batch(config.dead_letter_dir)
+            )
+            .outputMode("append")
+            .option("checkpointLocation", config.dead_letter_checkpoint_dir)
+            .trigger(processingTime=config.trigger_interval)
+            .start()
+        )
+        active_queries.append(dead_letter_query)
+
+        def _handle_shutdown(signum, frame) -> None:
+            logger.info("received signal %s, stopping streaming queries...", signum)
+            for query in active_queries:
+                if query.isActive:
+                    query.stop()
+
+        signal.signal(signal.SIGINT, _handle_shutdown)
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+
         spark.streams.awaitAnyTermination()
     finally:
-        for q in active_queries:
-            if q.isActive:
+        # Clean up any query that successfully started, even if starting the
+        # other query or registering a signal handler fails.
+        for query in active_queries:
+            if query.isActive:
                 continue
-            exc = q.exception()
+            try:
+                exc = query.exception()
+            except Exception:
+                logger.exception("could not retrieve error for query %s", query.id)
+                continue
             if exc is not None:
-                logger.error("streaming query %s terminated with error: %s", q.id, exc)
-        for q in active_queries:
-            if q.isActive:
-                q.stop()
-        dual_writer.close()
-        spark.stop()
-        logger.info("spark_consumer stopped")
+                logger.error(
+                    "streaming query %s terminated with error: %s",
+                    query.id,
+                    exc,
+                )
+
+        for query in active_queries:
+            if query.isActive:
+                try:
+                    query.stop()
+                except Exception:
+                    logger.exception("failed to stop streaming query %s", query.id)
+
+        if dual_writer is not None:
+            try:
+                dual_writer.close()
+            except Exception:
+                logger.exception("failed to close dual sink writer")
+
+        try:
+            spark.stop()
+        finally:
+            logger.info("spark_consumer stopped")
 
 
 if __name__ == "__main__":

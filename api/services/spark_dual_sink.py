@@ -27,20 +27,36 @@ def build_dual_sink_writer() -> DualSinkWriter:
     )
 
 
+# GeoIP enrichment (enrichment/spark_enrichment.py) puts its results on the
+# stream as geo_* columns, which is the contract the detection rules read.
+# LogEvent -- and therefore PostgreSQL metadata and the Elasticsearch
+# `country` / `city` / `location` fields -- uses the unprefixed names. The
+# mapping lives here, at the one place stream rows become LogEvents.
+GEO_STREAM_TO_LOGEVENT = {
+    "geo_country": "country",
+    "geo_city": "city",
+    "geo_latitude": "latitude",
+    "geo_longitude": "longitude",
+}
+
+
 def write_valid_events_batch(writer: DualSinkWriter):
     """Return a foreachBatch callback for canonical LogEvent columns."""
 
     fields = list(LogEvent.model_fields.keys())
 
     def _write(batch_df, batch_id: int) -> None:
-        available = [
-            name
-            for name in fields
-            if name in batch_df.columns
+        present = set(batch_df.columns)
+
+        selected = [name for name in fields if name in present]
+        selected += [
+            batch_df[source].alias(target)
+            for source, target in GEO_STREAM_TO_LOGEVENT.items()
+            if source in present and target not in present
         ]
 
         rows = batch_df.select(
-            *available
+            *selected
         ).toLocalIterator()
 
         events = [

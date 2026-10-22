@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Tests
+pytest
+# Builds a tiny real-format MMDB so enrichment tests don't need the licensed
+# GeoLite2 download.
+mmdb-writer
