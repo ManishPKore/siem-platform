@@ -1,8 +1,10 @@
-"""Spark pipeline step: add GeoIP columns to the normalized event stream.
+"""Spark pipeline steps: add GeoIP and ASN columns to the normalized event stream.
 
     logs-raw -> parse -> normalize_event() -> is_normalization_valid()
                                                      |
                               valid rows ---> add_geoip_columns()   <- here
+                                                     |
+                                             add_asn_columns()      <- here
                                                      |
                                       +--------------+-------------+
                                       v                            v
@@ -12,6 +14,8 @@ Column contract: detection_engine/rules/impossible_travel.py reads
 ``geo_country``, ``geo_latitude`` and ``geo_longitude``;
 tests/enrichment/test_enrichment_contract.py fails if either side drifts.
 ``geo_is_private`` stays on the stream only (not part of the stored LogEvent).
+``asn_number`` / ``asn_org`` are likewise stream columns for detection rules
+and sinks to build on; they are not part of the stored LogEvent yet.
 
 Notes
 * Vectorized pandas_udf (Arrow), not a row-at-a-time UDF, in the spirit of
@@ -35,11 +39,14 @@ from pyspark.sql.functions import pandas_udf
 from pyspark.sql.types import (
     BooleanType,
     DoubleType,
+    LongType,
     StringType,
     StructField,
     StructType,
 )
 
+from enrichment import asn as _asn
+from enrichment.asn import ASNEnricher
 from enrichment.geoip import GeoIPEnricher, resolve_db_path
 
 GEO_COUNTRY_COL = "geo_country"
@@ -119,3 +126,62 @@ def add_geoip_columns(
     for column in GEO_COLUMNS:
         out = out.withColumn(column, F.col(f"_geo.{column}"))
     return out.drop("_geo")
+
+
+# ---------------------------------------------------------------------- ASN
+ASN_NUMBER_COL = "asn_number"
+ASN_ORG_COL = "asn_org"
+
+ASN_COLUMNS = (ASN_NUMBER_COL, ASN_ORG_COL)
+
+# ASNs are unsigned 32-bit (up to 4,294,967,295) -- LongType, not IntegerType.
+_ASN_SCHEMA = StructType(
+    [
+        StructField(ASN_NUMBER_COL, LongType(), True),
+        StructField(ASN_ORG_COL, StringType(), True),
+    ]
+)
+
+_asn_enrichers: dict[str, ASNEnricher] = {}
+
+
+def get_asn_enricher(db_path: Optional[Union[str, Path]] = None) -> ASNEnricher:
+    """Process-wide ``ASNEnricher`` for ``db_path`` (the Reader opens once)."""
+    key = str(_asn.resolve_db_path(db_path))
+    enricher = _asn_enrichers.get(key)
+    if enricher is None:
+        with _lock:
+            enricher = _asn_enrichers.get(key)
+            if enricher is None:
+                enricher = ASNEnricher(key)
+                _asn_enrichers[key] = enricher
+    return enricher
+
+
+def _build_asn_udf(db_path: Optional[str]):
+    @pandas_udf(_ASN_SCHEMA)
+    def _asn_lookup(ips: pd.Series) -> pd.DataFrame:
+        enricher = get_asn_enricher(db_path)
+        records = [
+            enricher.enrich(ip if isinstance(ip, str) else None) for ip in ips
+        ]
+        frame = pd.DataFrame.from_records(records, columns=list(ASN_COLUMNS))
+        # Nullable Int64 keeps large ASNs exact instead of going via float64.
+        frame[ASN_NUMBER_COL] = frame[ASN_NUMBER_COL].astype("Int64")
+        return frame
+
+    return _asn_lookup.asNondeterministic()
+
+
+def add_asn_columns(
+    df: DataFrame,
+    ip_col: str = "source_ip",
+    db_path: Optional[Union[str, Path]] = None,
+) -> DataFrame:
+    """Append asn_number (long) and asn_org (string). Never drops or filters
+    rows; private, invalid, null and unknown IPs get null ASN fields."""
+    udf = _build_asn_udf(str(db_path) if db_path is not None else None)
+    out = df.withColumn("_asn", udf(F.col(ip_col).cast("string")))
+    for column in ASN_COLUMNS:
+        out = out.withColumn(column, F.col(f"_asn.{column}"))
+    return out.drop("_asn")

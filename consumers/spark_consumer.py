@@ -9,10 +9,11 @@ into the canonical schema from Issue #6 (consumers/schemas.py -- see
 consumers/normalizer.py, Issue #11), validates the normalized result, and
 fans out into two sinks:
 
-    * valid records   -> GeoIP enrichment (enrichment/spark_enrichment.py:
+    * valid records   -> GeoIP + ASN enrichment (enrichment/spark_enrichment.py:
       adds geo_country / geo_city / geo_latitude / geo_longitude /
-      geo_is_private, the columns detection rules such as
-      impossible_travel read) -> PostgreSQL + Elasticsearch dual sink.
+      geo_is_private plus asn_number / asn_org, the columns detection
+      rules such as impossible_travel read) -> PostgreSQL + Elasticsearch
+      dual sink.
     * invalid records (unparsable JSON, missing/blank required fields
       after normalization, or an unrecognized raw `event_type` that
       normalize_event() couldn't map to a known source) -> an
@@ -95,6 +96,11 @@ Configuration (environment variables)
                                      private IPs are flagged, public IPs get
                                      null geo fields, and a warning is logged
                                      at startup.
+    ASN_DB_PATH                     default "data/GeoLite2-ASN.mmdb" (see
+                                     README "ASN Database Setup"). If the
+                                     file is missing the job still runs:
+                                     asn_number / asn_org are null and a
+                                     warning is logged at startup.
 
 Checkpointing & recovery
 -------------------------
@@ -155,8 +161,9 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from consumers.log_consumer import DEFAULT_TOPIC
+from enrichment.asn import resolve_db_path as resolve_asn_db_path
 from enrichment.geoip import resolve_db_path
-from enrichment.spark_enrichment import add_geoip_columns
+from enrichment.spark_enrichment import add_asn_columns, add_geoip_columns
 from api.services.spark_dual_sink import (
     build_dual_sink_writer,
     write_valid_events_batch,
@@ -451,6 +458,17 @@ def main() -> None:
                 geoip_db,
             )
         enriched_df = add_geoip_columns(valid_df, ip_col="source_ip")
+
+        # ASN enrichment (asn_number / asn_org) follows GeoIP on the same
+        # valid rows; it degrades to null fields if the database is missing.
+        asn_db = resolve_asn_db_path()
+        if not asn_db.is_file():
+            logger.warning(
+                "ASN database not found at %s -- asn_number / asn_org will be "
+                "null (see README 'ASN Database Setup')",
+                asn_db,
+            )
+        enriched_df = add_asn_columns(enriched_df, ip_col="source_ip")
 
         dual_writer = build_dual_sink_writer()
 

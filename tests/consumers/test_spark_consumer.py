@@ -1114,8 +1114,20 @@ class TestDeadLetter:
 
         assert output_files
 
-        written_text = output_files[0].read_text(
-            encoding="utf-8"
+        # Spark may create empty part files, so inspect all non-empty
+        # JSON output files instead of assuming the first one has data.
+        non_empty_files = [
+            path for path in output_files
+            if path.stat().st_size > 0
+        ]
+
+        assert non_empty_files, (
+            "No non-empty dead-letter JSON files were written"
+        )
+
+        written_text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in non_empty_files
         )
 
         assert "invalid-json" in written_text

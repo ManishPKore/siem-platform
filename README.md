@@ -77,3 +77,42 @@ Notes:
   restart the Spark consumer to pick up the new file.
 - Run the enrichment tests with `pytest tests/enrichment` (install
   `requirements-dev.txt` first; no MaxMind download is needed for tests).
+
+  ## ASN Database Setup
+
+Events are also enriched with the Autonomous System Number and organization
+of the source IP (`asn_number`, `asn_org`) from the free MaxMind
+GeoLite2-ASN database. This tells an analyst whether traffic comes from a
+cloud provider (`DIGITALOCEAN`, `AMAZON`), an ISP or a hosting company. Like
+the GeoIP file, the `.mmdb` is licensed and git-ignored.
+
+1. Use the same MaxMind account and license key as for GeoIP.
+2. Download GeoLite2 ASN (MMDB) into `data/`:
+
+```bash
+   curl -L -u "<ACCOUNT_ID>:<LICENSE_KEY>" -o GeoLite2-ASN.tar.gz \
+     "https://download.maxmind.com/geoip/databases/GeoLite2-ASN/download?suffix=tar.gz"
+   tar -xzf GeoLite2-ASN.tar.gz
+   mv GeoLite2-ASN_*/GeoLite2-ASN.mmdb data/
+   rm -rf GeoLite2-ASN_* GeoLite2-ASN.tar.gz
+```
+3. Confirm `data/GeoLite2-ASN.mmdb` exists. To keep it elsewhere set
+   `ASN_DB_PATH` in `.env`.
+
+If the file is missing the pipeline still runs: `asn_number` / `asn_org` are
+null and a warning is logged when the Spark consumer starts. A file that is
+not an ASN database (e.g. the City database) is rejected at startup.
+
+Usage:
+
+```python
+from enrichment import ASNEnricher, enrich_event
+
+ASNEnricher().enrich("8.8.8.8")   # {"asn_number": 15169, "asn_org": "GOOGLE"}
+ASNEnricher().enrich("10.0.0.1")  # {"asn_number": None, "asn_org": None}
+
+enrich_event({"source_ip": "8.8.8.8"})  # adds geo_* and asn_* fields in one call
+```
+
+Run the tests with `pytest tests/enrichment/test_asn.py` (no download needed;
+one extra test runs against the real database when it is present).

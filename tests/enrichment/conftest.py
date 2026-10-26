@@ -1,8 +1,8 @@
 """Shared fixtures for tests/enrichment/.
 
-``city_db`` builds a tiny but *real* MaxMind-format city database (via the
-``mmdb-writer`` dev dependency), so the tests exercise the genuine
-``geoip2.database.Reader`` path without the licensed GeoLite2 file.
+``city_db`` / ``asn_db`` build tiny but *real* MaxMind-format databases (via
+the ``mmdb-writer`` dev dependency), so the tests exercise the genuine
+``geoip2.database.Reader`` path without the licensed GeoLite2 files.
 """
 
 from __future__ import annotations
@@ -22,6 +22,16 @@ KNOWN_IPS = {
 }
 COUNTRY_ONLY_IP = "1.1.1.1"
 UNKNOWN_PUBLIC_IP = "93.184.216.34"
+
+# ip -> (asn_number, asn_org). Mirrors real GeoLite2-ASN records.
+KNOWN_ASNS = {
+    "8.8.8.8": (15169, "GOOGLE"),
+    "104.131.0.1": (14061, "DIGITALOCEAN-ASN"),
+    "52.95.110.1": (16509, "AMAZON-02"),
+    "81.2.69.142": (4200000000, "BIG-PRIVATE-USE-ASN"),  # > 2**31: uint32 range
+}
+ASN_IPV6 = "2001:4860:4860::8888"  # Google public DNS, same AS as 8.8.8.8
+ASN_NUMBER_ONLY_IP = "185.199.108.1"  # record without an organization
 
 
 @pytest.fixture(scope="session")
@@ -53,6 +63,47 @@ def city_db(tmp_path_factory) -> str:
     )
 
     path = tmp_path_factory.mktemp("geoip") / "GeoLite2-City.mmdb"
+    writer.to_db_file(str(path))
+    return str(path)
+
+
+@pytest.fixture(scope="session")
+def asn_db(tmp_path_factory) -> str:
+    mmdb_writer = pytest.importorskip(
+        "mmdb_writer",
+        reason="dev dependency 'mmdb-writer' not installed (requirements-dev.txt)",
+    )
+    from netaddr import IPSet
+
+    # Real GeoLite2-ASN is an IPv6 database that also answers IPv4 lookups.
+    writer = mmdb_writer.MMDBWriter(
+        ip_version=6,
+        ipv4_compatible=True,
+        database_type="GeoLite2-ASN",
+        languages=["en"],
+        description={"en": "siem-platform test ASN database"},
+    )
+    for ip, (number, org) in KNOWN_ASNS.items():
+        writer.insert_network(
+            IPSet([f"{ip}/32"]),
+            {
+                "autonomous_system_number": number,
+                "autonomous_system_organization": org,
+            },
+        )
+    writer.insert_network(
+        IPSet([f"{ASN_IPV6}/128"]),
+        {
+            "autonomous_system_number": 15169,
+            "autonomous_system_organization": "GOOGLE",
+        },
+    )
+    writer.insert_network(
+        IPSet([f"{ASN_NUMBER_ONLY_IP}/32"]),
+        {"autonomous_system_number": 64500},
+    )
+
+    path = tmp_path_factory.mktemp("asn") / "GeoLite2-ASN.mmdb"
     writer.to_db_file(str(path))
     return str(path)
 
