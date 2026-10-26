@@ -19,7 +19,7 @@ Kafka
     ↓
 Normalization
     ↓
-Enrichment (GeoIP)
+Enrichment (GeoIP + ASN)
     ↓
 Detection Engine
     ↓
@@ -37,3 +37,10 @@ adds `geo_country`, `geo_city`, `geo_latitude`, `geo_longitude` and
 GeoLite2-City database. Detection rules read the `geo_*` columns (impossible
 travel needs the coordinates); the storage sinks persist them as `country`,
 `city` and `location` (see `api/services/spark_dual_sink.py`).
+
+ASN enrichment follows GeoIP in the same step: `add_asn_columns()` adds
+`asn_number` and `asn_org` from a local GeoLite2-ASN database
+(`data/GeoLite2-ASN.mmdb`, override with `ASN_DB_PATH`). For plain-Python
+callers, `enrichment.enrich_event(event)` adds the geo and ASN fields in one
+call. The ASN columns are stream-only for now: detection rules can read them,
+but they are not yet persisted by the PostgreSQL / Elasticsearch sinks.

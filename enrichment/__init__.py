@@ -1,10 +1,11 @@
-"""Event enrichment (GeoIP today; ASN / threat intelligence later).
+"""Event enrichment exports.
 
-Only the plain-Python ``GeoIPEnricher`` is re-exported here so that importing
-``enrichment`` never pulls in PySpark. Spark integration lives in
-``enrichment.spark_enrichment``.
+Expose the plain-Python GeoIP and ASN enrichers and the event enrichment
+pipeline without importing PySpark.
 """
 
+from enrichment.asn import ASNEnricher
 from enrichment.geoip import GeoIPEnricher
+from enrichment.pipeline import enrich_event
 
-__all__ = ["GeoIPEnricher"]
+all = ["ASNEnricher", "GeoIPEnricher", "enrich_event"]

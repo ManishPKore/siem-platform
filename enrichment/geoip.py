@@ -18,6 +18,8 @@ import geoip2.database
 import geoip2.errors
 from maxminddb import InvalidDatabaseError
 
+from enrichment.ip_utils import is_non_public, parse_ip
+
 logger = logging.getLogger(__name__)
 
 ENV_DB_PATH = "GEOIP_DB_PATH"
@@ -146,24 +148,13 @@ class GeoIPEnricher:
     def _parse(
         ip: Any,
     ) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
-        if not isinstance(ip, str):
-            return None
-        try:
-            addr = ipaddress.ip_address(ip.strip())
-        except ValueError:
-            return None
-        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
-            return addr.ipv4_mapped
-        return addr
+        return parse_ip(ip)
 
     @staticmethod
     def _is_non_public(
         addr: Union[ipaddress.IPv4Address, ipaddress.IPv6Address],
     ) -> bool:
-        # `not is_global` covers RFC1918, loopback, link-local, CGNAT
-        # (100.64/10), documentation ranges (e.g. 203.0.113.0/24), reserved
-        # and unspecified addresses.
-        return (not addr.is_global) or addr.is_multicast
+        return is_non_public(addr)
 
     def _lookup_uncached(self, ip: str) -> dict[str, Any]:
         if self._reader is None:

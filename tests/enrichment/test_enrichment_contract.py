@@ -260,3 +260,59 @@ def test_raw_kafka_row_to_enriched_logevent_and_es_document(spark, city_db):
     private = next(e for e in writer.events if e.source_ip == "192.168.1.1")
     assert private.country is None and private.latitude is None
     assert "location" not in ElasticsearchStorageService.to_document(private)
+
+
+# --- pipeline.enrich_event <-> Spark columns ----------------------------------
+
+
+def test_enrich_event_fields_match_the_spark_stream_columns():
+    """The plain-Python and Spark paths must emit identical column names."""
+    from enrichment.pipeline import ENRICHMENT_FIELDS
+    from enrichment.spark_enrichment import ASN_COLUMNS
+
+    assert set(ENRICHMENT_FIELDS) == set(GEO_COLUMNS) | set(ASN_COLUMNS)
+
+
+def test_geo_field_map_matches_the_geoip_enricher_keys():
+    from enrichment.geoip import GeoIPEnricher
+    from enrichment.pipeline import GEO_FIELD_MAP
+    from enrichment.spark_enrichment import _RESULT_KEY_TO_COLUMN
+
+    assert GEO_FIELD_MAP == _RESULT_KEY_TO_COLUMN
+    assert set(GEO_FIELD_MAP) == set(GeoIPEnricher(reader=object()).enrich("10.0.0.1"))
+
+
+def test_asn_columns_are_stream_only_until_storage_supports_them():
+    """asn_* reach detection rules via the stream; LogEvent has no ASN fields
+    yet, so they must not leak into the (extra=forbid) sink adapter."""
+    assert "asn_number" not in LogEvent.model_fields
+    assert "asn_org" not in set(GEO_STREAM_TO_LOGEVENT.values())
+
+
+def test_asn_enriched_stream_rows_still_reach_the_sinks(spark, city_db, asn_db):
+    """Extra asn_* stream columns must not break write_valid_events_batch."""
+    from pyspark.sql import functions as F
+
+    from enrichment.spark_enrichment import add_asn_columns, add_geoip_columns
+
+    df = spark.createDataFrame(
+        [(str(uuid.uuid4()), "2026-10-19T10:00:00Z", "8.8.8.8")],
+        ["event_id", "timestamp", "source_ip"],
+    )
+    df = (
+        df.withColumn("event_type", F.lit("successful_login"))
+        .withColumn("severity", F.lit("INFO"))
+        .withColumn("raw_message", F.lit("Accepted password for alice"))
+        .withColumn("source", F.lit("ssh"))
+        .withColumn("username", F.lit("alice"))
+        .withColumn("auth_method", F.lit("password"))
+        .withColumn("success", F.lit(True))
+    )
+    enriched = add_asn_columns(
+        add_geoip_columns(df, db_path=city_db), db_path=asn_db
+    )
+    assert "asn_org" in enriched.columns
+
+    writer = CapturingWriter()
+    write_valid_events_batch(writer)(enriched, 0)
+    assert writer.events[0].country == "US"
