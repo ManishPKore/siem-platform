@@ -1,0 +1,18 @@
+# Local IP blocklist -- the fallback used when AbuseIPDB is unavailable or no
+# API key is configured. Any IP listed here ALWAYS gets is_known_threat=true,
+# reputation_score=100 and threat_categories=["local_blocklist"], without an
+# API call (it also applies to private addresses, e.g. a compromised host).
+#
+# Format: one IPv4/IPv6 address or CIDR range per line.
+#         '#' starts a comment (whole line or after an entry). Blank lines OK.
+#         Invalid lines are skipped and logged as a warning.
+#
+# The file is re-read automatically (about every 30 seconds) while the
+# pipeline is running -- no restart needed after editing it.
+#
+# Override the location with KNOWN_BAD_IPS_PATH in .env.
+#
+# Examples (remove the leading '# ' to activate):
+# 203.0.113.50                 # known scanner seen in incident 2026-10-12
+# 198.51.100.0/24              # hostile hosting range
+# 2001:db8:bad::/48            # IPv6 range

@@ -1,29 +1,29 @@
-"""Spark pipeline steps: add GeoIP and ASN columns to the normalized event stream.
+"""Spark pipeline steps: add GeoIP, ASN and IP reputation columns to the
+normalized event stream.
 
     logs-raw -> parse -> normalize_event() -> is_normalization_valid()
                                                      |
-                              valid rows ---> add_geoip_columns()   <- here
+                              valid rows ---> add_geoip_columns()
                                                      |
-                                             add_asn_columns()      <- here
+                                             add_asn_columns()
+                                                     |
+                                        add_reputation_columns()
                                                      |
                                       +--------------+-------------+
                                       v                            v
                           dual sink (PostgreSQL + ES)    detection rules
 
 Column contract: detection_engine/rules/impossible_travel.py reads
-``geo_country``, ``geo_latitude`` and ``geo_longitude``;
-tests/enrichment/test_enrichment_contract.py fails if either side drifts.
+``geo_country``, ``geo_latitude`` and ``geo_longitude``.
 ``geo_is_private`` stays on the stream only (not part of the stored LogEvent).
-``asn_number`` / ``asn_org`` are likewise stream columns for detection rules
-and sinks to build on; they are not part of the stored LogEvent yet.
+``asn_number`` / ``asn_org`` are likewise stream columns.
+Reputation columns are added for downstream detection and analytics.
 
 Notes
-* Vectorized pandas_udf (Arrow), not a row-at-a-time UDF, in the spirit of
-  consumers/normalizer.py. pandas/pyarrow are already in requirements.txt.
-* The MMDB reader can't be pickled, so each Python worker opens its own once
-  (``get_enricher``). The db path is captured in the UDF closure.
-* The UDF is non-deterministic so the optimizer runs it once per row, not
-  once per extracted geo_* column.
+* Vectorized pandas_udf (Arrow), not a row-at-a-time UDF.
+* Readers and enrichers are cached per Python worker.
+* UDFs are non-deterministic so the optimizer does not reuse their results
+  across extracted columns.
 """
 
 from __future__ import annotations
@@ -37,8 +37,10 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.functions import pandas_udf
 from pyspark.sql.types import (
+    ArrayType,
     BooleanType,
     DoubleType,
+    IntegerType,
     LongType,
     StringType,
     StructField,
@@ -48,6 +50,10 @@ from pyspark.sql.types import (
 from enrichment import asn as _asn
 from enrichment.asn import ASNEnricher
 from enrichment.geoip import GeoIPEnricher, resolve_db_path
+from enrichment.ip_reputation import (
+    IPReputationEnricher,
+    resolve_blocklist_path,
+)
 
 GEO_COUNTRY_COL = "geo_country"
 GEO_CITY_COL = "geo_city"
@@ -185,3 +191,106 @@ def add_asn_columns(
     for column in ASN_COLUMNS:
         out = out.withColumn(column, F.col(f"_asn.{column}"))
     return out.drop("_asn")
+
+
+# --------------------------------------------------------------- IP reputation
+REPUTATION_SCORE_COL = "reputation_score"
+IS_KNOWN_THREAT_COL = "is_known_threat"
+THREAT_CATEGORIES_COL = "threat_categories"
+
+REPUTATION_COLUMNS = (
+    REPUTATION_SCORE_COL,
+    IS_KNOWN_THREAT_COL,
+    THREAT_CATEGORIES_COL,
+)
+
+_REPUTATION_SCHEMA = StructType(
+    [
+        StructField(REPUTATION_SCORE_COL, IntegerType(), True),
+        StructField(IS_KNOWN_THREAT_COL, BooleanType(), True),
+        StructField(THREAT_CATEGORIES_COL, ArrayType(StringType()), True),
+    ]
+)
+
+_reputation_enrichers: dict[str, IPReputationEnricher] = {}
+
+
+def get_reputation_enricher(
+    blocklist_path: Optional[Union[str, Path]] = None,
+) -> IPReputationEnricher:
+    """Return a process-wide IPReputationEnricher for the selected blocklist.
+
+    Each Python worker maintains its own enricher, cache and daily API budget.
+    API credentials should be obtained from the worker's environment.
+    """
+    key = str(resolve_blocklist_path(blocklist_path))
+    enricher = _reputation_enrichers.get(key)
+
+    if enricher is None:
+        with _lock:
+            enricher = _reputation_enrichers.get(key)
+            if enricher is None:
+                enricher = IPReputationEnricher(blocklist_path=key)
+                _reputation_enrichers[key] = enricher
+
+    return enricher
+
+
+def reputation_frame(
+    ips: pd.Series,
+    enricher: IPReputationEnricher,
+) -> pd.DataFrame:
+    """Build the pandas result frame used by the reputation pandas UDF."""
+    records = [
+        enricher.enrich(ip if isinstance(ip, str) else None)
+        for ip in ips
+    ]
+
+    frame = pd.DataFrame.from_records(
+        records,
+        columns=list(REPUTATION_COLUMNS),
+    )
+    frame[REPUTATION_SCORE_COL] = frame[REPUTATION_SCORE_COL].astype("Int64")
+
+    return frame
+
+
+def _build_reputation_udf(blocklist_path: Optional[str]):
+    @pandas_udf(_REPUTATION_SCHEMA)
+    def _reputation_lookup(ips: pd.Series) -> pd.DataFrame:
+        return reputation_frame(
+            ips,
+            get_reputation_enricher(blocklist_path),
+        )
+
+    return _reputation_lookup.asNondeterministic()
+
+
+def add_reputation_columns(
+    df: DataFrame,
+    ip_col: str = "source_ip",
+    blocklist_path: Optional[Union[str, Path]] = None,
+) -> DataFrame:
+    """Append IP reputation columns without dropping or filtering events.
+
+    Adds:
+    - reputation_score: nullable integer score
+    - is_known_threat: nullable boolean indicating a known threat
+    - threat_categories: array of threat category strings
+
+    Private, invalid and null IPs should remain unassessed, and unavailable
+    external reputation services should fall back to the local blocklist.
+    """
+    udf = _build_reputation_udf(
+        str(blocklist_path) if blocklist_path is not None else None
+    )
+
+    out = df.withColumn(
+        "_rep",
+        udf(F.col(ip_col).cast("string")),
+    )
+
+    for column in REPUTATION_COLUMNS:
+        out = out.withColumn(column, F.col(f"_rep.{column}"))
+
+    return out.drop("_rep")

@@ -18,6 +18,7 @@ env/
 # Data
 data/*
 !data/.gitkeep
+!data/known_bad_ips.txt
 
 # MaxMind databases
 *.mmdb

@@ -28,10 +28,33 @@ KNOWN_ASNS = {
     "8.8.8.8": (15169, "GOOGLE"),
     "104.131.0.1": (14061, "DIGITALOCEAN-ASN"),
     "52.95.110.1": (16509, "AMAZON-02"),
-    "81.2.69.142": (4200000000, "BIG-PRIVATE-USE-ASN"),  # > 2**31: uint32 range
+    "81.2.69.142": (4200000000, "BIG-PRIVATE-USE-ASN"),
+    # > 2**31: uint32 range
 }
-ASN_IPV6 = "2001:4860:4860::8888"  # Google public DNS, same AS as 8.8.8.8
-ASN_NUMBER_ONLY_IP = "185.199.108.1"  # record without an organization
+ASN_IPV6 = "2001:4860:4860::8888"
+# Google public DNS, same AS as 8.8.8.8
+ASN_NUMBER_ONLY_IP = "185.199.108.1"
+# record without an organization
+
+
+_REPUTATION_ENV_VARS = (
+    "ABUSEIPDB_API_KEY",
+    "ABUSEIPDB_THREAT_THRESHOLD",
+    "ABUSEIPDB_DAILY_LIMIT",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_reputation_env(monkeypatch, tmp_path):
+    """No real API key, no developer blocklist: tests must be hermetic."""
+    for name in _REPUTATION_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setenv(
+        "KNOWN_BAD_IPS_PATH",
+        str(tmp_path / "no_blocklist.txt"),
+    )
+    yield
 
 
 @pytest.fixture(scope="session")
@@ -115,20 +138,36 @@ def spark():
     old_hostname = os.environ.get("SPARK_LOCAL_HOSTNAME")
     os.environ["SPARK_LOCAL_HOSTNAME"] = "localhost"
 
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("siem-enrichment-tests")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.sql.session.timeZone", "UTC")
-        .getOrCreate()
-    )
-    session.sparkContext.setLogLevel("ERROR")
+    # Python workers inherit this process's environment when Spark starts:
+    # make sure a developer's real AbuseIPDB key can never reach them.
+    saved_env = {
+        name: os.environ.pop(name, None)
+        for name in _REPUTATION_ENV_VARS
+    }
 
-    yield session
+    try:
+        session = (
+            SparkSession.builder.master("local[2]")
+            .appName("siem-enrichment-tests")
+            .config("spark.ui.enabled", "false")
+            .config("spark.sql.shuffle.partitions", "2")
+            .config("spark.sql.session.timeZone", "UTC")
+            .getOrCreate()
+        )
+        session.sparkContext.setLogLevel("ERROR")
 
-    session.stop()
-    if old_hostname is None:
-        os.environ.pop("SPARK_LOCAL_HOSTNAME", None)
-    else:
-        os.environ["SPARK_LOCAL_HOSTNAME"] = old_hostname
+        yield session
+
+    finally:
+        # Restore the Spark session and the environment even if a test fails.
+        if "session" in locals():
+            session.stop()
+
+        if old_hostname is None:
+            os.environ.pop("SPARK_LOCAL_HOSTNAME", None)
+        else:
+            os.environ["SPARK_LOCAL_HOSTNAME"] = old_hostname
+
+        for name, value in saved_env.items():
+            if value is not None:
+                os.environ[name] = value
