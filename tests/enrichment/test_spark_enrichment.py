@@ -6,19 +6,25 @@ pytest.importorskip("pyspark")
 pytest.importorskip("pyarrow")
 
 from pyspark.sql.types import (
+    ArrayType,
     BooleanType,
     DoubleType,
+    IntegerType,
     LongType,
     StringType,
     StructField,
     StructType,
 )
 
+from enrichment.ip_reputation import IPReputationEnricher
 from enrichment.spark_enrichment import (
     ASN_COLUMNS,
     GEO_COLUMNS,
+    REPUTATION_COLUMNS,
     add_asn_columns,
     add_geoip_columns,
+    add_reputation_columns,
+    reputation_frame,
 )
 from tests.enrichment.conftest import UNKNOWN_PUBLIC_IP
 
@@ -70,7 +76,8 @@ def test_enriches_public_private_unknown_and_invalid(spark, city_db):
     unknown = out["evt-2"]
     assert unknown["geo_is_private"] is False and unknown["geo_country"] is None
 
-    for event_id in ("evt-3", "evt-4"):  # invalid / null IP: all-null, no crash
+    for event_id in ("evt-3", "evt-4"):
+        # Invalid / null IP: all-null, no crash.
         assert all(out[event_id][c] is None for c in GEO_COLUMNS)
 
 
@@ -237,3 +244,202 @@ def test_asn_works_on_a_streaming_dataframe(spark, asn_db, tmp_path):
     rows = {row["event_id"]: row.asDict() for row in seen}
     assert (rows["e1"]["asn_number"], rows["e1"]["asn_org"]) == (15169, "GOOGLE")
     assert rows["e2"]["asn_number"] is None
+
+
+# ------------------------------------------------------------ reputation step
+
+
+@pytest.fixture
+def blocklist(tmp_path):
+    path = tmp_path / "known_bad_ips.txt"
+    path.write_text(
+        "45.155.205.233\n"
+        "203.0.113.0/24  # hostile range\n"
+        "10.9.8.7\n"
+    )
+    return str(path)
+
+
+def test_reputation_adds_columns_with_expected_types(spark, blocklist):
+    out = add_reputation_columns(
+        make_df(spark, ["8.8.8.8"]), blocklist_path=blocklist
+    )
+    assert out.columns == ["event_id", "source_ip", *REPUTATION_COLUMNS]
+    types = {f.name: f.dataType for f in out.schema.fields}
+    assert types["reputation_score"] == IntegerType()
+    assert types["is_known_threat"] == BooleanType()
+    assert types["threat_categories"] == ArrayType(StringType())
+
+
+def test_reputation_flags_blocklisted_and_leaves_the_rest_unassessed(
+    spark, blocklist
+):
+    ips = [
+        "45.155.205.233",  # listed address
+        "203.0.113.77",  # inside a listed CIDR range
+        "10.9.8.7",  # listed private host
+        "8.8.8.8",  # public, not listed, no API key in the workers
+        "192.168.1.1",  # private
+        "not_an_ip",
+        None,
+    ]
+    out = by_event(
+        add_reputation_columns(make_df(spark, ips), blocklist_path=blocklist)
+    )
+
+    for event_id in ("evt-0", "evt-1", "evt-2"):
+        assert out[event_id]["reputation_score"] == 100
+        assert out[event_id]["is_known_threat"] is True
+        assert out[event_id]["threat_categories"] == ["local_blocklist"]
+
+    for event_id in ("evt-3", "evt-4", "evt-5", "evt-6"):
+        assert out[event_id]["reputation_score"] is None
+        assert out[event_id]["is_known_threat"] is False
+        assert out[event_id]["threat_categories"] == []
+
+
+def test_reputation_all_unassessed_batch_does_not_crash(spark, blocklist):
+    out = add_reputation_columns(
+        make_df(spark, ["10.0.0.1", None, "junk"]), blocklist_path=blocklist
+    )
+    assert all(r["reputation_score"] is None for r in out.collect())
+    assert all(r["threat_categories"] == [] for r in out.collect())
+
+
+def test_reputation_never_drops_or_reorders_rows(spark, blocklist):
+    ips = ["45.155.205.233", "10.0.0.1", "garbage", "8.8.8.8"] * 25
+    out = add_reputation_columns(make_df(spark, ips), blocklist_path=blocklist)
+    assert [r["source_ip"] for r in out.collect()] == ips
+
+
+def test_reputation_missing_blocklist_does_not_break_the_stream(spark, tmp_path):
+    missing = str(tmp_path / "nope.txt")
+    out = by_event(
+        add_reputation_columns(make_df(spark, ["8.8.8.8"]), blocklist_path=missing)
+    )
+    assert out["evt-0"]["is_known_threat"] is False
+
+
+def test_reputation_custom_ip_column(spark, blocklist):
+    df = spark.createDataFrame([("45.155.205.233",)], ["client_ip"])
+    out = add_reputation_columns(df, ip_col="client_ip", blocklist_path=blocklist)
+    assert out.collect()[0]["is_known_threat"] is True
+
+
+def test_reputation_udf_is_evaluated_once_per_row_not_once_per_column(
+    spark, blocklist
+):
+    plan = add_reputation_columns(
+        make_df(spark, ["8.8.8.8"]), blocklist_path=blocklist
+    )._jdf.queryExecution().executedPlan().toString()
+    assert plan.count("ArrowEvalPython") == 1
+
+
+def test_all_three_enrichment_steps_compose(spark, city_db, asn_db, blocklist):
+    df = add_reputation_columns(
+        add_asn_columns(
+            add_geoip_columns(make_df(spark, ["8.8.8.8"]), db_path=city_db),
+            db_path=asn_db,
+        ),
+        blocklist_path=blocklist,
+    )
+    assert df.columns == [
+        "event_id",
+        "source_ip",
+        *GEO_COLUMNS,
+        *ASN_COLUMNS,
+        *REPUTATION_COLUMNS,
+    ]
+    row = by_event(df)["evt-0"]
+    assert (row["geo_country"], row["asn_org"]) == ("US", "GOOGLE")
+    assert row["is_known_threat"] is False
+
+
+def test_reputation_works_on_a_streaming_dataframe(spark, blocklist, tmp_path):
+    source_dir = tmp_path / "events"
+    source_dir.mkdir()
+    (source_dir / "batch.json").write_text(
+        "\n".join(
+            [
+                '{"event_id": "e1", "source_ip": "45.155.205.233"}',
+                '{"event_id": "e2", "source_ip": "8.8.8.8"}',
+            ]
+        )
+    )
+    stream = spark.readStream.schema(INPUT_SCHEMA).json(str(source_dir))
+    enriched = add_reputation_columns(stream, blocklist_path=blocklist)
+    assert enriched.isStreaming
+
+    seen = []
+    query = (
+        enriched.writeStream.foreachBatch(
+            lambda batch_df, _id: seen.extend(batch_df.collect())
+        )
+        .option("checkpointLocation", str(tmp_path / "checkpoint"))
+        .trigger(availableNow=True)
+        .start()
+    )
+    assert query.awaitTermination(120)
+
+    rows = {row["event_id"]: row.asDict() for row in seen}
+    assert rows["e1"]["is_known_threat"] is True
+    assert rows["e2"]["is_known_threat"] is False
+
+
+class _MockedAbuseIPDB:
+    """Mock requests.Session; it cannot cross Spark worker processes, so
+    verify the API path through reputation_frame in this process."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def get(self, url, **kwargs):
+        self.calls += 1
+        score = (
+            95
+            if kwargs["params"]["ipAddress"] == "45.155.205.233"
+            else 0
+        )
+        payload = {
+            "data": {
+                "abuseConfidenceScore": score,
+                "reports": [{"categories": [18, 22]}] if score else [],
+            }
+        }
+        return type(
+            "R",
+            (),
+            {
+                "status_code": 200,
+                "headers": {},
+                "json": lambda self: payload,
+            },
+        )()
+
+    def close(self):
+        pass
+
+
+def test_reputation_frame_with_a_mocked_api_matches_the_udf_schema(tmp_path):
+    session = _MockedAbuseIPDB()
+    enricher = IPReputationEnricher(
+        api_key="test-key",
+        session=session,
+        blocklist_path=tmp_path / "n.txt",
+    )
+    ips = ["45.155.205.233", "8.8.8.8", "10.0.0.1", None, "45.155.205.233"]
+    frame = reputation_frame(ips, enricher)
+
+    assert list(frame.columns) == list(REPUTATION_COLUMNS)
+    assert str(frame["reputation_score"].dtype) == "Int64"
+    assert frame["reputation_score"].tolist()[:2] == [95, 0]
+    assert frame["reputation_score"].isna().tolist() == [
+        False,
+        False,
+        True,
+        True,
+        False,
+    ]
+    assert frame["is_known_threat"].tolist() == [True, False, False, False, True]
+    assert frame["threat_categories"].tolist()[0] == ["brute_force", "ssh"]
+    assert session.calls == 2  # repeated IP served from cache, private skipped

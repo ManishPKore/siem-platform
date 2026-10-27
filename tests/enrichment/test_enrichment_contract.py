@@ -268,9 +268,11 @@ def test_raw_kafka_row_to_enriched_logevent_and_es_document(spark, city_db):
 def test_enrich_event_fields_match_the_spark_stream_columns():
     """The plain-Python and Spark paths must emit identical column names."""
     from enrichment.pipeline import ENRICHMENT_FIELDS
-    from enrichment.spark_enrichment import ASN_COLUMNS
+    from enrichment.spark_enrichment import ASN_COLUMNS, REPUTATION_COLUMNS
 
-    assert set(ENRICHMENT_FIELDS) == set(GEO_COLUMNS) | set(ASN_COLUMNS)
+    assert set(ENRICHMENT_FIELDS) == (
+        set(GEO_COLUMNS) | set(ASN_COLUMNS) | set(REPUTATION_COLUMNS)
+    )
 
 
 def test_geo_field_map_matches_the_geoip_enricher_keys():
@@ -312,6 +314,58 @@ def test_asn_enriched_stream_rows_still_reach_the_sinks(spark, city_db, asn_db):
         add_geoip_columns(df, db_path=city_db), db_path=asn_db
     )
     assert "asn_org" in enriched.columns
+
+    writer = CapturingWriter()
+    write_valid_events_batch(writer)(enriched, 0)
+    assert writer.events[0].country == "US"
+
+
+def test_reputation_columns_are_stream_only_until_storage_supports_them():
+    """Like asn_*: detection rules can read them from the stream, but LogEvent
+    (extra=forbid) has no such fields yet, so they must not leak into the sink
+    adapter."""
+    from enrichment.spark_enrichment import REPUTATION_COLUMNS
+
+    for column in REPUTATION_COLUMNS:
+        assert column not in LogEvent.model_fields
+        assert column not in set(GEO_STREAM_TO_LOGEVENT.values())
+
+
+def test_fully_enriched_stream_rows_still_reach_the_sinks(
+    spark, city_db, asn_db, tmp_path
+):
+    """geo + asn + reputation columns together must not break the sink adapter."""
+    from pyspark.sql import functions as F
+
+    from enrichment.spark_enrichment import (
+        add_asn_columns,
+        add_geoip_columns,
+        add_reputation_columns,
+    )
+
+    blocklist = tmp_path / "bad.txt"
+    blocklist.write_text("8.8.8.8\n")
+
+    df = spark.createDataFrame(
+        [(str(uuid.uuid4()), "2026-10-19T10:00:00Z", "8.8.8.8")],
+        ["event_id", "timestamp", "source_ip"],
+    )
+    df = (
+        df.withColumn("event_type", F.lit("successful_login"))
+        .withColumn("severity", F.lit("INFO"))
+        .withColumn("raw_message", F.lit("Accepted password for alice"))
+        .withColumn("source", F.lit("ssh"))
+        .withColumn("username", F.lit("alice"))
+        .withColumn("auth_method", F.lit("password"))
+        .withColumn("success", F.lit(True))
+    )
+    enriched = add_reputation_columns(
+        add_asn_columns(
+            add_geoip_columns(df, db_path=city_db), db_path=asn_db
+        ),
+        blocklist_path=str(blocklist),
+    )
+    assert "is_known_threat" in enriched.columns
 
     writer = CapturingWriter()
     write_valid_events_batch(writer)(enriched, 0)

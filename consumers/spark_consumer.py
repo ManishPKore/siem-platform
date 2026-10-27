@@ -101,6 +101,15 @@ Configuration (environment variables)
                                      file is missing the job still runs:
                                      asn_number / asn_org are null and a
                                      warning is logged at startup.
+    ABUSEIPDB_API_KEY               optional. Enables AbuseIPDB reputation
+                                     lookups (README "Threat Intelligence
+                                     Setup"). Unset = local blocklist only
+                                     (data/known_bad_ips.txt, override with
+                                     KNOWN_BAD_IPS_PATH) and a startup
+                                     warning. The key is read by each Spark
+                                     Python worker from its own environment.
+    ABUSEIPDB_THREAT_THRESHOLD      default 50 (score >= this is a threat)
+    ABUSEIPDB_DAILY_LIMIT           default 1000 (free tier) per worker
 
 Checkpointing & recovery
 -------------------------
@@ -163,7 +172,12 @@ from pyspark.sql import functions as F
 from consumers.log_consumer import DEFAULT_TOPIC
 from enrichment.asn import resolve_db_path as resolve_asn_db_path
 from enrichment.geoip import resolve_db_path
-from enrichment.spark_enrichment import add_asn_columns, add_geoip_columns
+from enrichment.ip_reputation import api_key_configured, resolve_blocklist_path
+from enrichment.spark_enrichment import (
+    add_asn_columns,
+    add_geoip_columns,
+    add_reputation_columns,
+)
 from api.services.spark_dual_sink import (
     build_dual_sink_writer,
     write_valid_events_batch,
@@ -469,6 +483,18 @@ def main() -> None:
                 asn_db,
             )
         enriched_df = add_asn_columns(enriched_df, ip_col="source_ip")
+
+        # IP reputation (reputation_score / is_known_threat / threat_categories):
+        # AbuseIPDB when a key is configured, otherwise the local blocklist.
+        # Private IPs are never sent to the API.
+        if not api_key_configured():
+            logger.warning(
+                "ABUSEIPDB_API_KEY is not set -- IP reputation will use the "
+                "local blocklist only (%s); see README 'Threat Intelligence "
+                "Setup'",
+                resolve_blocklist_path(),
+            )
+        enriched_df = add_reputation_columns(enriched_df, ip_col="source_ip")
 
         dual_writer = build_dual_sink_writer()
 

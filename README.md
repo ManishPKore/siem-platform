@@ -116,3 +116,66 @@ enrich_event({"source_ip": "8.8.8.8"})  # adds geo_* and asn_* fields in one cal
 
 Run the tests with `pytest tests/enrichment/test_asn.py` (no download needed;
 one extra test runs against the real database when it is present).
+
+## Threat Intelligence Setup
+
+Every source IP is checked for a bad reputation. This adds three fields to
+enriched events:
+
+| Field | Meaning |
+|---|---|
+| `reputation_score` | 0-100 AbuseIPDB "abuse confidence". `null` = not assessed (private IP, no API key, API unavailable), which is different from `0` = assessed and clean. |
+| `is_known_threat` | `true` for any local-blocklist hit, or a score at or above the threshold (default 50). |
+| `threat_categories` | e.g. `["brute_force", "ssh"]`, most-reported first. `["local_blocklist"]` for blocklist hits. |
+
+**Lookup order:** local blocklist, then private-IP skip (private IPs are never
+sent to the API), then a 1-hour cache, then the AbuseIPDB API.
+
+### AbuseIPDB API key
+
+1. Register at https://www.abuseipdb.com/register and create a key (free tier:
+   1000 checks/day).
+2. Put it in `.env`:
+
+```bash
+ABUSEIPDB_API_KEY=<your key>
+```
+
+The enrichment code reads real environment variables and does not load `.env`
+itself. Docker Compose reads `.env` automatically; for a local run, export it
+first: `set -a; source .env; set +a`.
+
+Without a key the pipeline still runs on the local blocklist only, and logs a
+warning at startup. The key is sent in the `Key` header and is never logged.
+If the API is down, rate limited (HTTP 429) or the daily budget is used up, the
+enricher falls back to the blocklist and resumes automatically. Optional
+settings: `ABUSEIPDB_THREAT_THRESHOLD` (default 50) and `ABUSEIPDB_DAILY_LIMIT`
+(default 1000). With Docker, `docker-compose.yml` passes these through to the
+Spark containers.
+
+Note: the cache and daily budget are per Spark Python worker, so several
+workers each spend from the same account quota. Keep that in mind on the free
+tier; the server-side 429 handling is the backstop.
+
+### Local blocklist
+
+Add one IP or CIDR range per line to `data/known_bad_ips.txt` (`#` starts a
+comment). Anything listed there **always** gets `is_known_threat=true`,
+`reputation_score=100` and no API call, including private addresses. The file
+is re-read automatically about every 30 seconds, so no restart is needed.
+Override the location with `KNOWN_BAD_IPS_PATH`.
+
+Usage:
+
+```python
+from enrichment import IPReputationEnricher, enrich_event
+
+IPReputationEnricher().enrich("45.155.205.233")
+# {"reputation_score": 100, "is_known_threat": True,
+#  "threat_categories": ["brute_force", "ssh"]}
+
+enrich_event({"source_ip": "8.8.8.8"})  # geo_*, asn_* and reputation fields
+```
+
+Run the tests with `pytest tests/enrichment/test_ip_reputation.py` (the
+AbuseIPDB API is fully mocked; no key or network needed).

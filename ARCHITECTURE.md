@@ -19,7 +19,7 @@ Kafka
     ↓
 Normalization
     ↓
-Enrichment (GeoIP + ASN)
+Enrichment (GeoIP + ASN + IP reputation)
     ↓
 Detection Engine
     ↓
@@ -44,3 +44,13 @@ ASN enrichment follows GeoIP in the same step: `add_asn_columns()` adds
 callers, `enrichment.enrich_event(event)` adds the geo and ASN fields in one
 call. The ASN columns are stream-only for now: detection rules can read them,
 but they are not yet persisted by the PostgreSQL / Elasticsearch sinks.
+
+IP reputation follows ASN in the same step: `add_reputation_columns()` adds
+`reputation_score`, `is_known_threat` and `threat_categories`. A local
+blocklist (`data/known_bad_ips.txt`) is checked first and always wins; private
+IPs are skipped; public IPs are looked up in AbuseIPDB through a one-hour
+cache, with a local daily budget and rate-limit handling. If no API key is
+configured or the API is unavailable, the step degrades to the blocklist
+alone. Like the ASN columns, these are stream-only for now: detection rules
+can read them, but the PostgreSQL / Elasticsearch sinks do not persist them
+yet.
