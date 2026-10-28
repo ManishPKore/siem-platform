@@ -179,3 +179,38 @@ enrich_event({"source_ip": "8.8.8.8"})  # geo_*, asn_* and reputation fields
 
 Run the tests with `pytest tests/enrichment/test_ip_reputation.py` (the
 AbuseIPDB API is fully mocked; no key or network needed).
+
+## Enrichment Pipeline (`logs-enriched`)
+
+`spark_consumer.py` runs one enrichment stage after normalization:
+
+```
+logs-raw -> parse -> normalize -> validate -> enrichment stage -> Kafka logs-enriched
+                                                              -> PostgreSQL + Elasticsearch
+```
+
+GeoIP, ASN and IP reputation run in a single UDF
+(`enrichment/pipeline_enricher.py`). Each event is enriched exactly once and
+the same batch is written to every sink. Events in `logs-enriched` carry every
+normalized field plus `country`, `city`, `latitude`, `longitude`, `asn_number`,
+`asn_org`, `reputation_score`, `is_known_threat`, `threat_categories`,
+`is_private_ip` and `enriched_at`. Unknown values are explicit `null`s.
+Elasticsearch stores `location` as a `geo_point`. A missing database, a missing
+AbuseIPDB key or a failing enricher never stops the pipeline: the affected
+fields are `null`.
+
+**Upgrading an existing Elasticsearch cluster:** run `python scripts/init_es.py`
+*before* starting the new consumer. It adds the new ASN / reputation fields to
+the live index in place (additive only; no data loss, no rollover needed).
+
+Downstream consumers (for example the rules engine) should read `logs-enriched`
+and use `consumers.enriched_events.parse_enriched_events()`, which restores the
+`geo_*` column names the detection rules expect.
+
+### Benchmark and load test
+
+```bash
+python scripts/benchmark_enrichment.py micro            # per-event latency (<10 ms)
+python scripts/benchmark_enrichment.py spark --cores 4  # throughput (>=500 events/s)
+python scripts/benchmark_enrichment.py kafka            # end to end (<10 s), needs docker + spark_consumer
+```

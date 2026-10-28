@@ -54,3 +54,11 @@ configured or the API is unavailable, the step degrades to the blocklist
 alone. Like the ASN columns, these are stream-only for now: detection rules
 can read them, but the PostgreSQL / Elasticsearch sinks do not persist them
 yet.
+
+The enrichment stage is now unified: `build_enrichment_stage()` in
+`spark_consumer.py` runs GeoIP, ASN and IP reputation in one UDF pass
+(`enrichment/pipeline_enricher.py`) between the normalizer and everything
+downstream. One foreachBatch persists each enriched batch and writes it to the
+`logs-enriched` Kafka topic and to PostgreSQL + Elasticsearch, so every event
+is enriched (and every AbuseIPDB call made) exactly once. The rules engine
+should consume `logs-enriched` rather than re-enrich the stream.

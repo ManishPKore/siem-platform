@@ -54,13 +54,14 @@ Configuration (environment variables; constructor arguments win)
 from __future__ import annotations
 
 import ipaddress
+from concurrent.futures import ThreadPoolExecutor, wait
 import logging
 import os
 import threading
 import time
 from collections import Counter, OrderedDict
 from pathlib import Path
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Iterable, Optional, Union
 
 import requests
 
@@ -86,6 +87,8 @@ DEFAULT_DAILY_LIMIT = 1000  # AbuseIPDB free tier: 1,000 checks/day
 DEFAULT_FAILURE_THRESHOLD = 3
 DEFAULT_FAILURE_COOLDOWN_SECONDS = 60.0
 DEFAULT_BLOCKLIST_RELOAD_SECONDS = 30.0
+DEFAULT_PREFETCH_WORKERS = 8
+DEFAULT_PREFETCH_DEADLINE_SECONDS = 3.0
 
 AUTH_FAILURE_COOLDOWN_SECONDS = 3600.0
 RATE_LIMIT_DEFAULT_WAIT_SECONDS = 3600.0
@@ -577,6 +580,19 @@ class IPReputationEnricher:
         * Public IP: cached or fresh AbuseIPDB result; if the API is
           unavailable, not assessed.
         """
+        return self._enrich(ip, network=True)
+
+    def enrich_cached(self, ip: str) -> dict[str, Any]:
+        """Like ``enrich`` but never touches the network.
+
+        Answers from the blocklist and the cache only; a public IP that is not
+        cached comes back as not assessed (and is not cached, so a later
+        ``enrich`` / ``prefetch`` can still look it up). This is the hot path
+        after ``prefetch``: it makes per-event latency independent of the API.
+        """
+        return self._enrich(ip, network=False)
+
+    def _enrich(self, ip: Any, *, network: bool) -> dict[str, Any]:
         addr = parse_ip(ip)
         if addr is None:
             self._warn_invalid(ip)
@@ -595,11 +611,66 @@ class IPReputationEnricher:
             self._bump("cache_hits")
             return self._public(cached)
 
+        if not network:
+            return _unassessed()
+
         result = self._query_api(key)
         if result is None:
             return _unassessed()
         self._cache.set(key, result)
         return self._public(result)
+
+    def prefetch(
+        self,
+        ips: Iterable[Any],
+        *,
+        max_workers: int = DEFAULT_PREFETCH_WORKERS,
+        deadline_seconds: Optional[float] = None,
+    ) -> int:
+        """Warm the cache for the distinct, uncached public IPs in ``ips``.
+
+        Looks the IPs up concurrently, so a batch with 20 new IPs costs about
+        one API round trip instead of 20 sequential ones. Skips private,
+        invalid, blocklisted and already-cached IPs, and does nothing while the
+        API is paused (cooldown / rate limit).
+
+        ``deadline_seconds`` bounds how long the caller waits: lookups that
+        have not finished by then are abandoned (queued ones are cancelled,
+        in-flight ones finish in the background and still populate the cache).
+        That is what keeps a slow API from stalling a streaming batch.
+
+        Returns the number of lookups that completed. Never raises.
+        """
+        if not self.api_enabled or self._is_paused():
+            return 0
+
+        candidates: list[str] = []
+        seen: set = set()
+        for ip in ips:
+            addr = parse_ip(ip)
+            if addr is None or addr in seen:
+                continue
+            seen.add(addr)
+            if is_non_public(addr) or self._blocklist.contains(addr):
+                continue
+            if self._cache.get(str(addr)) is not None:
+                continue
+            candidates.append(str(addr))
+
+        if not candidates:
+            return 0
+
+        pool = ThreadPoolExecutor(
+            max_workers=max(1, min(max_workers, len(candidates))),
+            thread_name_prefix="abuseipdb",
+        )
+        try:
+            futures = [pool.submit(self.enrich, candidate) for candidate in candidates]
+            done, _ = wait(futures, timeout=deadline_seconds)
+            return len(done)
+        finally:
+            # enrich() never raises; don't block on stragglers past the deadline.
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def close(self) -> None:
         session, self._session = self._session, None
@@ -628,6 +699,10 @@ class IPReputationEnricher:
             IS_KNOWN_THREAT_KEY: result[IS_KNOWN_THREAT_KEY],
             THREAT_CATEGORIES_KEY: list(result[THREAT_CATEGORIES_KEY]),
         }
+
+    def _is_paused(self) -> bool:
+        with self._lock:
+            return self._clock() < self._blocked_until
 
     def _bump(self, counter: str) -> None:
         with self._lock:

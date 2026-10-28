@@ -131,6 +131,13 @@ MAPPINGS: dict[str, Any] = {
         "city": {"type": "keyword"},
         "location": {"type": "geo_point"},
 
+        # ASN and IP reputation enrichment
+        "asn_number": {"type": "long"},
+        "asn_org": {"type": "keyword", "ignore_above": 256},
+        "reputation_score": {"type": "integer"},
+        "is_known_threat": {"type": "boolean"},
+        "threat_categories": {"type": "keyword"},
+
         # Source-specific and enrichment metadata
         "metadata": {
             "type": "object",

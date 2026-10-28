@@ -71,6 +71,8 @@ Configuration (environment variables)
 --------------------------------------
     KAFKA_BOOTSTRAP_SERVERS         required, e.g. "localhost:9092"
     KAFKA_LOGS_RAW_TOPIC            default "logs-raw"
+    KAFKA_ENRICHED_TOPIC            default "logs-enriched" (enriched events
+                                     are published here, see below)
     SPARK_MASTER                    default "local[2]" (2+ threads
                                      required for streaming -- with 1
                                      thread there's no capacity left to
@@ -169,15 +171,15 @@ from typing import Optional
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from consumers.log_consumer import DEFAULT_TOPIC
-from enrichment.asn import resolve_db_path as resolve_asn_db_path
-from enrichment.geoip import resolve_db_path
-from enrichment.ip_reputation import api_key_configured, resolve_blocklist_path
-from enrichment.spark_enrichment import (
-    add_asn_columns,
-    add_geoip_columns,
-    add_reputation_columns,
+from consumers.enriched_events import DEFAULT_ENRICHED_TOPIC
+from consumers.enriched_sink import (
+    KafkaEnrichedWriter,
+    KafkaSinkConfig,
+    make_enriched_batch_handler,
 )
+from consumers.log_consumer import DEFAULT_TOPIC
+from enrichment.pipeline_enricher import startup_warnings
+from enrichment.spark_enrichment import add_enrichment_columns
 from api.services.spark_dual_sink import (
     build_dual_sink_writer,
     write_valid_events_batch,
@@ -220,6 +222,7 @@ DEFAULT_DEAD_LETTER_DIR = "data/dead_letter"
 class SparkConsumerConfig:
     bootstrap_servers: str
     topic: str = DEFAULT_TOPIC
+    enriched_topic: str = DEFAULT_ENRICHED_TOPIC
     master: str = DEFAULT_MASTER
     app_name: str = DEFAULT_APP_NAME
     starting_offsets: str = DEFAULT_STARTING_OFFSETS
@@ -242,6 +245,9 @@ class SparkConsumerConfig:
         return cls(
             bootstrap_servers=bootstrap,
             topic=os.environ.get("KAFKA_LOGS_RAW_TOPIC", DEFAULT_TOPIC),
+            enriched_topic=os.environ.get(
+                "KAFKA_ENRICHED_TOPIC", DEFAULT_ENRICHED_TOPIC
+            ),
             master=os.environ.get("SPARK_MASTER", DEFAULT_MASTER),
             app_name=os.environ.get("SPARK_APP_NAME", DEFAULT_APP_NAME),
             starting_offsets=os.environ.get(
@@ -374,6 +380,31 @@ def parse_normalize_and_validate(raw_df: DataFrame) -> DataFrame:
 # --------------------------------------------------------------------------- #
 
 
+def build_enrichment_stage(
+    valid_df: DataFrame,
+    *,
+    geoip_db_path: Optional[str] = None,
+    asn_db_path: Optional[str] = None,
+    blocklist_path: Optional[str] = None,
+) -> DataFrame:
+    """Run unified enrichment after normalization and before detection/storage.
+
+    One UDF pass adds GeoIP, ASN and IP-reputation columns, plus ``enriched_at``
+    (when this stage ran), so every event carries its own end-to-end latency.
+    Only valid rows get here; dead-letter rows are written as they are.
+
+    The stage never drops a row. Optional paths override the corresponding
+    environment/default paths; the AbuseIPDB key comes from worker environment.
+    """
+    return add_enrichment_columns(
+        valid_df,
+        ip_col="source_ip",
+        geoip_db_path=geoip_db_path,
+        asn_db_path=asn_db_path,
+        blocklist_path=blocklist_path,
+    ).withColumn("enriched_at", F.current_timestamp())
+
+
 def write_dead_letter_batch(dead_letter_dir: str):
     """Returns a foreachBatch function that logs a warning (with count)
     for any micro-batch containing invalid records, then appends them to
@@ -462,45 +493,31 @@ def main() -> None:
         valid_df = parsed_df.filter(F.col("_is_valid")).drop("_is_valid")
         invalid_df = parsed_df.filter(~F.col("_is_valid")).drop("_is_valid")
 
-        # GeoIP enrichment sits between normalization and detection/storage.
-        # Only valid rows are enriched; dead-letter rows are written as-is.
-        geoip_db = resolve_db_path()
-        if not geoip_db.is_file():
-            logger.warning(
-                "GeoIP database not found at %s -- public IPs will not be "
-                "enriched (see README 'GeoIP Database Setup')",
-                geoip_db,
-            )
-        enriched_df = add_geoip_columns(valid_df, ip_col="source_ip")
+        # Degraded setups (missing GeoIP/ASN database, no AbuseIPDB key) are
+        # allowed -- the affected fields are just null -- but say so loudly once.
+        for message in startup_warnings():
+            logger.warning(message)
 
-        # ASN enrichment (asn_number / asn_org) follows GeoIP on the same
-        # valid rows; it degrades to null fields if the database is missing.
-        asn_db = resolve_asn_db_path()
-        if not asn_db.is_file():
-            logger.warning(
-                "ASN database not found at %s -- asn_number / asn_org will be "
-                "null (see README 'ASN Database Setup')",
-                asn_db,
-            )
-        enriched_df = add_asn_columns(enriched_df, ip_col="source_ip")
-
-        # IP reputation (reputation_score / is_known_threat / threat_categories):
-        # AbuseIPDB when a key is configured, otherwise the local blocklist.
-        # Private IPs are never sent to the API.
-        if not api_key_configured():
-            logger.warning(
-                "ABUSEIPDB_API_KEY is not set -- IP reputation will use the "
-                "local blocklist only (%s); see README 'Threat Intelligence "
-                "Setup'",
-                resolve_blocklist_path(),
-            )
-        enriched_df = add_reputation_columns(enriched_df, ip_col="source_ip")
+        # Enrichment stage: normalizer -> enrichment -> rules / sinks.
+        enriched_df = build_enrichment_stage(valid_df)
 
         dual_writer = build_dual_sink_writer()
 
+        # One foreachBatch fans the enriched batch out to Kafka (logs-enriched)
+        # and to PostgreSQL + Elasticsearch, enriching each event exactly once.
+        enriched_handler = make_enriched_batch_handler(
+            storage_handler=write_valid_events_batch(dual_writer),
+            kafka_writer=KafkaEnrichedWriter(
+                KafkaSinkConfig(
+                    bootstrap_servers=config.bootstrap_servers,
+                    topic=config.enriched_topic,
+                )
+            ),
+        )
+
         valid_query = (
             enriched_df.writeStream
-            .foreachBatch(write_valid_events_batch(dual_writer))
+            .foreachBatch(enriched_handler)
             .outputMode("append")
             .option("checkpointLocation", config.console_checkpoint_dir)
             .trigger(processingTime=config.trigger_interval)

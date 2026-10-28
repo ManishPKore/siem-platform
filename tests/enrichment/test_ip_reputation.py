@@ -864,8 +864,12 @@ def test_a_newly_blocklisted_ip_overrides_a_cached_clean_result(
 def test_blocklist_path_resolution(monkeypatch, tmp_path):
     monkeypatch.delenv(ENV_BLOCKLIST_PATH, raising=False)
     assert resolve_blocklist_path() == REPO_ROOT / "data" / "known_bad_ips.txt"
-    monkeypatch.setenv(ENV_BLOCKLIST_PATH, "/from/env.txt")
-    assert str(resolve_blocklist_path()) == os.path.normpath("/from/env.txt")
+
+    # Use a real temporary path so the assertion is portable across Windows and Linux.
+    env_path = tmp_path / "from_env.txt"
+    monkeypatch.setenv(ENV_BLOCKLIST_PATH, str(env_path))
+    assert resolve_blocklist_path() == env_path
+
     explicit = tmp_path / "x.txt"
     assert resolve_blocklist_path(explicit) == explicit
     monkeypatch.setenv(ENV_BLOCKLIST_PATH, "data/known_bad_ips.txt")
@@ -1137,3 +1141,63 @@ def test_real_http_429_is_honoured(local_abuseipdb, tmp_path, clock):
         assert enricher.enrich("1.1.1.1") == UNASSESSED  # server answers 429
         assert enricher.enrich(MALICIOUS_IP) == UNASSESSED  # paused: no request
     assert len(local_abuseipdb) == 1
+
+# --------------------------------------------------------------------------- #
+# prefetch / enrich_cached (batch path used by the Spark UDF)
+# --------------------------------------------------------------------------- #
+
+
+def test_enrich_cached_never_touches_the_network(make):
+    session = FakeSession(abuse(90, [18]))
+    enricher = make(session)
+    assert enricher.enrich_cached(MALICIOUS_IP) == UNASSESSED
+    assert session.call_count == 0
+    enricher.enrich(MALICIOUS_IP)  # now cached
+    assert enricher.enrich_cached(MALICIOUS_IP)["reputation_score"] == 90
+    assert session.call_count == 1
+
+
+def test_enrich_cached_still_honours_the_blocklist_and_private_rules(make, blocklist_file):
+    blocklist_file("10.9.8.7\n")
+    enricher = make(FakeSession(), blocklist_path=blocklist_file.path)
+    assert enricher.enrich_cached("10.9.8.7")["is_known_threat"] is True
+    assert enricher.enrich_cached("10.0.0.1") == UNASSESSED
+
+
+def test_prefetch_warms_the_cache_with_one_call_per_distinct_public_ip(make, blocklist_file):
+    blocklist_file("1.1.1.1\n")
+    session = FakeSession(handler=lambda ip: abuse(0))
+    enricher = make(session, blocklist_path=blocklist_file.path)
+    enricher.enrich(GOOGLE_DNS)  # already cached
+
+    done = enricher.prefetch(
+        [GOOGLE_DNS, "9.9.9.9", "9.9.9.9", "10.0.0.1", "1.1.1.1", "garbage", None, MALICIOUS_IP]
+    )
+    assert done == 2  # 9.9.9.9 and MALICIOUS_IP only
+    assert sorted(c[1]["params"]["ipAddress"] for c in session.calls) == sorted(
+        [GOOGLE_DNS, "9.9.9.9", MALICIOUS_IP])
+    for ip in ("9.9.9.9", MALICIOUS_IP):
+        assert enricher.enrich_cached(ip)["reputation_score"] == 0
+
+
+def test_prefetch_is_a_no_op_without_an_api_or_while_paused(make, clock):
+    assert make(FakeSession(), api_key="").prefetch(["9.9.9.9"]) == 0
+    session = FakeSession(FakeResponse(status=429, headers={"Retry-After": "600"}))
+    enricher = make(session)
+    enricher.enrich(MALICIOUS_IP)  # trips the pause
+    assert enricher.prefetch(["9.9.9.9", "8.8.4.4"]) == 0
+    assert session.call_count == 1
+
+
+def test_prefetch_deadline_abandons_slow_lookups(make):
+    import time as _time
+
+    def slow(ip):
+        _time.sleep(0.5)
+        return abuse(0)
+
+    enricher = make(FakeSession(handler=slow), daily_limit=None)
+    started = _time.perf_counter()
+    done = enricher.prefetch([f"30.0.0.{i}" for i in range(1, 9)], max_workers=2, deadline_seconds=0.1)
+    assert _time.perf_counter() - started < 0.4
+    assert done < 8

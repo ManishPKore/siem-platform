@@ -354,9 +354,10 @@ def test_explicit_argument_beats_the_environment(monkeypatch, tmp_path):
     assert resolve_db_path(explicit) == explicit
 
 
-def test_environment_beats_the_default(monkeypatch):
-    monkeypatch.setenv(ENV_DB_PATH, "/from/env.mmdb")
-    assert resolve_db_path() == Path("/from/env.mmdb")
+def test_environment_beats_the_default(monkeypatch, tmp_path):
+    custom_path = tmp_path / "from-env.mmdb"
+    monkeypatch.setenv(ENV_DB_PATH, str(custom_path))
+    assert resolve_db_path() == custom_path
 
 
 def test_relative_paths_are_anchored_at_the_repo_root(monkeypatch, tmp_path):
