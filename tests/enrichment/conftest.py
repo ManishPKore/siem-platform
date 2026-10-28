@@ -13,6 +13,7 @@ import sys
 os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
+import maxminddb
 import pytest
 
 KNOWN_IPS = {
@@ -105,6 +106,7 @@ def asn_db(tmp_path_factory) -> str:
         database_type="GeoLite2-ASN",
         languages=["en"],
         description={"en": "siem-platform test ASN database"},
+        int_type="u32",
     )
     for ip, (number, org) in KNOWN_ASNS.items():
         writer.insert_network(
@@ -128,6 +130,29 @@ def asn_db(tmp_path_factory) -> str:
 
     path = tmp_path_factory.mktemp("asn") / "GeoLite2-ASN.mmdb"
     writer.to_db_file(str(path))
+
+    # Verify that the generated MMDB preserves the full unsigned ASN range.
+    # MODE_AUTO selects the problematic reader path in the current environment.
+    # MODE_FILE is explicitly used here to validate the database itself.
+    with maxminddb.open_database(
+        str(path),
+        mode=maxminddb.MODE_FILE,
+    ) as reader:
+        record = reader.get("81.2.69.142")
+        expected_asn = KNOWN_ASNS["81.2.69.142"][0]
+
+        if record is None:
+            raise AssertionError(
+                "Generated ASN database did not return the expected test record."
+            )
+
+        actual_asn = record.get("autonomous_system_number")
+        if actual_asn != expected_asn:
+            raise AssertionError(
+                "Generated ASN database did not preserve the full uint32 value: "
+                f"expected {expected_asn}, got {actual_asn!r}."
+            )
+
     return str(path)
 
 

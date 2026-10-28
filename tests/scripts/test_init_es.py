@@ -419,3 +419,55 @@ def test_main_returns_1_on_incompatible_configuration(monkeypatch):
     monkeypatch.setattr(init_es, "ensure_index", drift)
 
     assert init_es.main([]) == 1
+
+# --------------------------------------------------------------------------- #
+# Additive mapping update (new enrichment fields on a live index)
+# --------------------------------------------------------------------------- #
+
+NEW_FIELDS = {"asn_number": "long", "asn_org": "keyword", "reputation_score": "integer",
+              "is_known_threat": "boolean", "threat_categories": "keyword"}
+
+
+def test_enrichment_fields_are_declared_in_the_mapping():
+    for field, expected in NEW_FIELDS.items():
+        assert init_es.EXPECTED_FIELD_TYPES[field] == expected
+    assert init_es.MAPPINGS["properties"]["location"]["type"] == "geo_point"
+    assert len(init_es.MAPPINGS["properties"]) < 100  # index.mapping.total_fields.limit
+
+
+def test_ensure_mapping_fields_adds_only_the_missing_fields_in_place():
+    props = _expected_props()
+    for field in NEW_FIELDS:
+        props.pop(field)
+    client = _client()
+    client.indices.get_mapping.return_value = _mapping_response(props)
+
+    added = init_es.ensure_mapping_fields(client)
+
+    assert added == {FIRST: sorted(NEW_FIELDS)}
+    call = client.indices.put_mapping.call_args
+    assert call.kwargs["index"] == FIRST
+    assert set(call.kwargs["properties"]) == set(NEW_FIELDS)  # nothing else is touched
+
+
+def test_ensure_mapping_fields_is_a_no_op_when_nothing_is_missing():
+    client = _client()
+    assert init_es.ensure_mapping_fields(client) == {}
+    client.indices.put_mapping.assert_not_called()
+
+
+def test_ensure_index_upgrades_an_existing_index_instead_of_failing():
+    old = _expected_props()
+    for field in NEW_FIELDS:
+        old.pop(field)
+    client = _client()
+    state = {"props": old}
+
+    def put_mapping(index, properties):
+        state["props"] = {**state["props"], **properties}
+
+    client.indices.put_mapping.side_effect = put_mapping
+    client.indices.get_mapping.side_effect = lambda index: _mapping_response(state["props"])
+
+    assert init_es.ensure_index(client) is False  # upgraded, then verified compatible
+    assert set(NEW_FIELDS) <= set(state["props"])

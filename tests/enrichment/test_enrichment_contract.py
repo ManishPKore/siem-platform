@@ -284,18 +284,76 @@ def test_geo_field_map_matches_the_geoip_enricher_keys():
     assert set(GEO_FIELD_MAP) == set(GeoIPEnricher(reader=object()).enrich("10.0.0.1"))
 
 
-def test_asn_columns_are_stream_only_until_storage_supports_them():
-    """asn_* reach detection rules via the stream; LogEvent has no ASN fields
-    yet, so they must not leak into the (extra=forbid) sink adapter."""
-    assert "asn_number" not in LogEvent.model_fields
-    assert "asn_org" not in set(GEO_STREAM_TO_LOGEVENT.values())
+ENRICHMENT_FIELDS_STORED = (
+    "asn_number",
+    "asn_org",
+    "reputation_score",
+    "is_known_threat",
+    "threat_categories",
+)
 
 
-def test_asn_enriched_stream_rows_still_reach_the_sinks(spark, city_db, asn_db):
-    """Extra asn_* stream columns must not break write_valid_events_batch."""
+def test_asn_and_reputation_fields_are_part_of_the_stored_logevent():
+    for field in ENRICHMENT_FIELDS_STORED:
+        assert field in LogEvent.model_fields
+
+
+def test_asn_and_reputation_fields_reach_elasticsearch_and_postgres():
+    from api.services.storage_service import EventStorageService
+    from scripts.es_mapping import MAPPINGS
+
+    event = LogEvent(
+        **ssh_event(
+            **GEO,
+            asn_number=15169,
+            asn_org="GOOGLE",
+            reputation_score=0,
+            is_known_threat=False,
+            threat_categories=[],
+        )
+    )
+
+    doc = ElasticsearchStorageService.to_document(event)
+    assert doc["asn_org"] == "GOOGLE" and doc["asn_number"] == 15169
+    assert doc["reputation_score"] == 0 and doc["is_known_threat"] is False
+    assert doc["location"] == {"lat": 37.39, "lon": -122.08}
+    assert set(doc) <= set(MAPPINGS["properties"])  # strict mapping accepts it
+    assert MAPPINGS["properties"]["location"]["type"] == "geo_point"
+
+    row = EventStorageService(session_factory=lambda: None)._to_row(event)
+    assert row["metadata"]["asn_org"] == "GOOGLE"
+    assert row["metadata"]["is_known_threat"] is False
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("reputation_score", 101),
+        ("reputation_score", -1),
+        ("asn_number", -1),
+        ("asn_number", 4_294_967_296),
+    ],
+)
+def test_logevent_rejects_out_of_range_enrichment_values(field, value):
+    with pytest.raises(ValidationError):
+        LogEvent(**ssh_event(**{field: value}))
+
+
+def test_asn_enriched_stream_rows_still_reach_the_sinks(
+    spark, city_db, asn_db, tmp_path
+):
+    """Extra ASN and reputation columns must not break the sink adapter."""
     from pyspark.sql import functions as F
 
-    from enrichment.spark_enrichment import add_asn_columns, add_geoip_columns
+    from enrichment.spark_enrichment import (
+        add_asn_columns,
+        add_geoip_columns,
+        add_reputation_columns,
+    )
+
+    # Use an explicit test blocklist so the test is isolated from local config.
+    blocklist = tmp_path / "bad.txt"
+    blocklist.write_text("8.8.8.8\n", encoding="utf-8")
 
     df = spark.createDataFrame(
         [(str(uuid.uuid4()), "2026-10-19T10:00:00Z", "8.8.8.8")],
@@ -310,25 +368,24 @@ def test_asn_enriched_stream_rows_still_reach_the_sinks(spark, city_db, asn_db):
         .withColumn("auth_method", F.lit("password"))
         .withColumn("success", F.lit(True))
     )
-    enriched = add_asn_columns(
-        add_geoip_columns(df, db_path=city_db), db_path=asn_db
+    enriched = add_reputation_columns(
+        add_asn_columns(
+            add_geoip_columns(df, db_path=city_db),
+            db_path=asn_db,
+        ),
+        blocklist_path=str(blocklist),
     )
     assert "asn_org" in enriched.columns
+    assert "is_known_threat" in enriched.columns
 
     writer = CapturingWriter()
     write_valid_events_batch(writer)(enriched, 0)
-    assert writer.events[0].country == "US"
-
-
-def test_reputation_columns_are_stream_only_until_storage_supports_them():
-    """Like asn_*: detection rules can read them from the stream, but LogEvent
-    (extra=forbid) has no such fields yet, so they must not leak into the sink
-    adapter."""
-    from enrichment.spark_enrichment import REPUTATION_COLUMNS
-
-    for column in REPUTATION_COLUMNS:
-        assert column not in LogEvent.model_fields
-        assert column not in set(GEO_STREAM_TO_LOGEVENT.values())
+    event = writer.events[0]
+    assert event.country == "US"
+    assert (event.asn_number, event.asn_org) == (15169, "GOOGLE")
+    assert event.is_known_threat is True
+    assert event.reputation_score == 100
+    assert event.threat_categories == ["local_blocklist"]
 
 
 def test_fully_enriched_stream_rows_still_reach_the_sinks(

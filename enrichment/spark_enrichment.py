@@ -28,6 +28,7 @@ Notes
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 from typing import Optional, Union
@@ -54,6 +55,9 @@ from enrichment.ip_reputation import (
     IPReputationEnricher,
     resolve_blocklist_path,
 )
+from enrichment.pipeline_enricher import PipelineEnricher, null_enrichment
+
+logger = logging.getLogger(__name__)
 
 GEO_COUNTRY_COL = "geo_country"
 GEO_CITY_COL = "geo_city"
@@ -294,3 +298,147 @@ def add_reputation_columns(
         out = out.withColumn(column, F.col(f"_rep.{column}"))
 
     return out.drop("_rep")
+
+
+# --------------------------------------------------- unified enrichment stage
+# One UDF, one pass: GeoIP + ASN + reputation for every event. This is what the
+# streaming pipeline uses; the three add_*_columns functions above remain as
+# composable building blocks (and for their own tests).
+ENRICHMENT_COLUMNS = (*GEO_COLUMNS, *ASN_COLUMNS, *REPUTATION_COLUMNS)
+
+_ENRICHMENT_SCHEMA = StructType(
+    [*_GEO_SCHEMA.fields, *_ASN_SCHEMA.fields, *_REPUTATION_SCHEMA.fields]
+)
+
+_pipeline_enrichers: dict[tuple, PipelineEnricher] = {}
+_failure_logged = 0
+
+
+def get_pipeline_enricher(
+    geoip_db_path: Optional[Union[str, Path]] = None,
+    asn_db_path: Optional[Union[str, Path]] = None,
+    blocklist_path: Optional[Union[str, Path]] = None,
+) -> PipelineEnricher:
+    """Process-wide ``PipelineEnricher`` for these paths.
+
+    Lives in each Spark Python worker for the life of that worker, so its
+    caches persist across partitions and micro-batches (workers are reused);
+    no broadcast variable is needed. Secrets (the AbuseIPDB key) are read from
+    the worker's environment, never shipped inside the UDF closure.
+    """
+    key = (
+        str(resolve_db_path(geoip_db_path)),
+        str(_asn.resolve_db_path(asn_db_path)),
+        str(resolve_blocklist_path(blocklist_path)),
+    )
+    enricher = _pipeline_enrichers.get(key)
+    if enricher is None:
+        with _lock:
+            enricher = _pipeline_enrichers.get(key)
+            if enricher is None:
+                enricher = PipelineEnricher(
+                    geoip_db_path=key[0],
+                    asn_db_path=key[1],
+                    blocklist_path=key[2],
+                )
+                _pipeline_enrichers[key] = enricher
+    return enricher
+
+
+def enrichment_frame(
+    ips: pd.Series,
+    enricher: Optional[PipelineEnricher],
+) -> pd.DataFrame:
+    """Build the pandas result frame for the unified UDF.
+
+    If the enricher is missing or the batch fails, return null enrichment
+    fields for every row rather than raising and crashing the Spark task.
+    """
+    values = [ip if isinstance(ip, str) else None for ip in ips]
+    try:
+        if enricher is None:
+            raise RuntimeError("no enricher available")
+        records = enricher.enrich_many(values)
+    except Exception:  # noqa: BLE001
+        global _failure_logged
+        _failure_logged += 1
+        if _failure_logged <= 5:
+            logger.exception(
+                "Enrichment failed for a batch of %d event(s); emitting null "
+                "enrichment fields",
+                len(values),
+            )
+        records = [null_enrichment() for _ in values]
+
+    frame = pd.DataFrame.from_records(records, columns=list(ENRICHMENT_COLUMNS))
+    # Nullable Int64 keeps big ASNs exact and None as null (not NaN).
+    frame[ASN_NUMBER_COL] = frame[ASN_NUMBER_COL].astype("Int64")
+    frame[REPUTATION_SCORE_COL] = frame[REPUTATION_SCORE_COL].astype("Int64")
+    return frame
+
+
+def _build_enrichment_udf(
+    geoip_db_path: Optional[str],
+    asn_db_path: Optional[str],
+    blocklist_path: Optional[str],
+):
+    @pandas_udf(_ENRICHMENT_SCHEMA)
+    def _enrich_ip(ips: pd.Series) -> pd.DataFrame:
+        try:
+            enricher = get_pipeline_enricher(
+                geoip_db_path,
+                asn_db_path,
+                blocklist_path,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not build the enrichment pipeline")
+            enricher = None
+        return enrichment_frame(ips, enricher)
+
+    return _enrich_ip.asNondeterministic()
+
+
+def add_enrichment_columns(
+    df: DataFrame,
+    ip_col: str = "source_ip",
+    *,
+    geoip_db_path: Optional[Union[str, Path]] = None,
+    asn_db_path: Optional[Union[str, Path]] = None,
+    blocklist_path: Optional[Union[str, Path]] = None,
+) -> DataFrame:
+    """Append every column in ENRICHMENT_COLUMNS with a single UDF pass.
+
+    Never drops or filters rows. Enrichment failures yield null fields, and
+    private, invalid or null IPs are handled by the composite enricher.
+    """
+    udf = _build_enrichment_udf(
+        str(geoip_db_path) if geoip_db_path is not None else None,
+        str(asn_db_path) if asn_db_path is not None else None,
+        str(blocklist_path) if blocklist_path is not None else None,
+    )
+    out = df.withColumn("_enrichment", udf(F.col(ip_col).cast("string")))
+    for column in ENRICHMENT_COLUMNS:
+        out = out.withColumn(column, F.col(f"_enrichment.{column}"))
+    return out.drop("_enrichment")
+
+
+def register_enrichment_udf(
+    spark,
+    name: str = "enrich_ip",
+    *,
+    geoip_db_path: Optional[Union[str, Path]] = None,
+    asn_db_path: Optional[Union[str, Path]] = None,
+    blocklist_path: Optional[Union[str, Path]] = None,
+):
+    """Register the composite enricher as a Spark SQL function.
+
+    ``SELECT enrich_ip(source_ip).geo_country FROM events`` returns the same
+    struct that ``add_enrichment_columns`` unpacks. Returns the UDF object.
+    """
+    udf = _build_enrichment_udf(
+        str(geoip_db_path) if geoip_db_path is not None else None,
+        str(asn_db_path) if asn_db_path is not None else None,
+        str(blocklist_path) if blocklist_path is not None else None,
+    )
+    spark.udf.register(name, udf)
+    return udf

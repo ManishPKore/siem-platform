@@ -107,6 +107,17 @@ class LogEvent(BaseModel):
     latitude: Optional[float] = Field(default=None, ge=-90, le=90)
     longitude: Optional[float] = Field(default=None, ge=-180, le=180)
 
+    # --- ASN enrichment (enrichment/asn.py) ---
+    asn_number: Optional[int] = Field(default=None, ge=0, le=4_294_967_295)
+    asn_org: Optional[str] = None
+
+    # --- IP reputation enrichment (enrichment/ip_reputation.py). A null
+    # reputation_score means "not assessed" (private IP, no API key, API
+    # unavailable), which is different from 0 ("assessed and clean"). ---
+    reputation_score: Optional[int] = Field(default=None, ge=0, le=100)
+    is_known_threat: Optional[bool] = None
+    threat_categories: Optional[list[str]] = None
+
     model_config = {"extra": "forbid"}
 
     # -- validators --------------------------------------------------

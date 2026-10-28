@@ -233,6 +233,42 @@ def verify_ilm(client: Elasticsearch) -> None:
         )
 
 
+
+def ensure_mapping_fields(client: Elasticsearch) -> dict[str, list[str]]:
+    """Add fields declared in MAPPINGS but missing from existing backing indices.
+
+    Index templates only apply to indices created *after* the template changes,
+    and ``dynamic: strict`` rejects documents carrying a field the live index
+    does not know. When the pipeline starts writing new fields (for example
+    the ASN and reputation enrichment), the current write index would reject
+    them until the next daily rollover. Adding a missing field in place is
+    additive and safe: existing fields, settings and data are never touched.
+
+    Returns {index: [added field names]} (empty when nothing was missing).
+    """
+    added: dict[str, list[str]] = {}
+
+    for index in _alias_indices(client):
+        mappings = client.indices.get_mapping(index=index)[index]["mappings"]
+        props = mappings.get("properties", {})
+        missing = {
+            name: spec
+            for name, spec in MAPPINGS["properties"].items()
+            if name not in props
+        }
+
+        if missing:
+            client.indices.put_mapping(index=index, properties=missing)
+            added[index] = sorted(missing)
+            logger.info(
+                "Added missing field(s) %s to existing index '%s'",
+                ", ".join(sorted(missing)),
+                index,
+            )
+
+    return added
+
+
 def _raise_if_incompatible(client: Elasticsearch, replicas: int, context: str) -> None:
     index = get_write_index(client)
     problems = verify_mapping(client, index, replicas)
@@ -267,6 +303,7 @@ def ensure_index(
         alias_exists = False
 
     if alias_exists:
+        ensure_mapping_fields(client)
         _raise_if_incompatible(client, replicas, "Write index")
         logger.info(
             "Alias '%s' already exists with the expected configuration", ALIAS
